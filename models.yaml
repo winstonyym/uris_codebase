@@ -1,0 +1,190 @@
+# models.yaml — model + prompt configuration for build_kg.py.
+#
+# `models:` is the catalogue of available LLMs. Each row is one runnable
+# model. The `backend` is either:
+#   * `openai`    — any OpenAI-compatible HTTP API (set base_url for
+#                   non-OpenAI servers).
+#   * `anthropic` — native Anthropic Messages API.
+# Rows commented out are kept as ready-to-uncomment templates.
+#
+# `pipeline:` (optional) lets you set defaults for the build_kg.py CLI
+# so you don't have to pass --text-model / --vision-model on every run.
+#
+# `prompts:` and `diagram_prompts:` are only consumed by the eval CLIs
+# (utils/eval.py and utils/diagram_eval.py). The pipeline ignores them
+# and uses `final_prompts/text_prompt.md` + `final_prompts/figure_prompt.md`
+# unless overridden by `pipeline.figure_prompt` / `pipeline.text_prompt`.
+
+models:
+  - name: claude-haiku-4.5
+    backend: anthropic
+    model: claude-haiku-4-5-20251001
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 8192
+
+  - name: claude-sonnet-4.6
+    backend: anthropic
+    model: claude-sonnet-4-6
+    api_key_env: ANTHROPIC_API_KEY
+    max_tokens: 8192
+
+  - name: gpt-4o-mini
+    backend: openai
+    model: gpt-4o-mini
+    api_key_env: OPENAI_API_KEY
+    max_tokens: 8192
+
+  - name: gpt-5.4
+    backend: openai
+    model: gpt-5.4
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: low
+    max_tokens: 32768
+
+  - name: gpt-4.1-nano
+    backend: openai
+    model: gpt-4.1-nano
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: none
+    max_tokens: 32768
+
+  - name: deepseek-v4-flash
+    backend: openai
+    model: deepseek-v4-flash
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    max_tokens: 16384
+
+  # - name: deepseek-v4-pro
+  #   backend: openai
+  #   model: deepseek-v4-pro
+  #   base_url: https://api.deepseek.com
+  #   api_key_env: DEEPSEEK_API_KEY
+  #   max_tokens: 32768
+
+  # - name: qwen3.6-flash
+  #   backend: openai
+  #   model: qwen3.6-flash
+  #   base_url: "https://dashscope-us.aliyuncs.com/compatible-mode/v1"
+  #   api_key_env: DASHSCOPE_API_KEY
+
+  # - name: gemini-3-flash
+  #   backend: openai
+  #   model: gemini-3-flash-preview
+  #   base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  #   api_key_env: GOOGLE_API_KEY
+  #   reasoning_effort: none
+
+  # - name: gemini-3-pro
+  #   backend: openai
+  #   model: gemini-3.1-pro-preview
+  #   base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  #   api_key_env: GOOGLE_API_KEY
+  #   reasoning_effort: medium
+  #   max_tokens: 32768
+
+# ---------------------------------------------------------------------------
+# Pipeline defaults (read by build_kg.py — overridable on the CLI)
+# ---------------------------------------------------------------------------
+pipeline:
+  text_model: deepseek-v4-flash
+  vision_model: gpt-5.4
+  verifier_model: gpt-4o-mini
+  figure_prompt: ./final_prompts/figure_prompt.md
+  text_prompt:   ./final_prompts/text_prompt.md
+
+# ---------------------------------------------------------------------------
+# Graph-RAG components (read by graph_rag/ FastAPI service)
+# ---------------------------------------------------------------------------
+#
+# Each entry below is a *component* the Graph-RAG service uses. Swap the
+# `model:` field to change which LLM/embedding model that component talks
+# to. Models must either appear in the `models:` catalogue above, or — for
+# the embedder — be a recognised embedding model name.
+#
+# Components:
+#   * embedder           — embedding model for node label+description
+#                          vectors (used by the Neo4j vector index).
+#   * recommender_reranker — small/fast LLM that scores candidate
+#                          node/edge suggestions, returning calibrated
+#                          alpha-confidence.
+#   * chat_agent         — tool-using LLM for the Modify-tab chat
+#                          (add_node / remove_node / add_edge /
+#                          remove_edge / query_effect).
+#   * causal_narrator    — LLM that writes the plain-English explanation
+#                          for "what if X increases?" questions, given a
+#                          deterministically-computed signed-path summary.
+
+components:
+  embedder:
+    provider: openai
+    model: text-embedding-3-small
+    api_key_env: OPENAI_API_KEY
+    dimensions: 512
+    # base_url:                 # uncomment to point at an OpenAI-compat embedding server
+
+  recommender_reranker:
+    model: claude-haiku-4.5    # references `models:` catalogue above
+    temperature: 0.0
+
+  chat_agent:
+    model: claude-haiku-4.5
+    temperature: 0.0
+
+  causal_narrator:
+    model: claude-haiku-4.5
+    temperature: 0.0
+
+# Graph-RAG runtime settings
+graph_rag:
+  neo4j_uri: neo4j+s://f52f4095.databases.neo4j.io
+  neo4j_user: f52f4095
+  neo4j_password: 6QQ78J-GtdLE6ho63sUlSCkuUALfijD7Vm4ksyLv4ys         
+  neo4j_database: f52f4095
+  vector_index_name: nodeLabelEmbedding
+  merged_kg_path: ./merged_kg.json
+  # Retrieval knobs
+  top_k_vector: 25              # candidates pulled by vector search
+  top_k_final:  10              # after rerank, returned to UI
+  max_hops:     2               # graph-neighbour expansion radius
+  damping:      0.6             # per-hop weight decay for causal paths
+  # Latency safety net: skip LLM rerank if N candidates are clearly distinct
+  skip_rerank_if_top_score_above: 0.92
+  # Also skip when the margin between candidate scores is large enough that
+  # reranking is unlikely to flip the ordering.
+  skip_rerank_if_margin_above:      0.18
+
+  # ── Caching ────────────────────────────────────────────────────────────
+  # All caches are optional. Redis is used opportunistically: if REDIS_URL
+  # is empty OR Redis is unreachable, the service silently falls back to
+  # in-process LRU caches. This makes the same image deployable to a
+  # one-container free tier as well as a horizontally-scaled cluster.
+  cache:
+    redis_url: "rediss://default:gQAAAAAAAfqyAAIgcDFkNmE1MjEyMzI2NDE0OGYxYTllNDNiYTcxZjA5NTY2MQ@organic-muskrat-129714.upstash.io:6379"
+    embedding_ttl_sec:    86400  # query-text → embedding (1 day)
+    response_ttl_sec:       300  # canonical (query, canvas) → response
+    semantic_threshold:    0.97  # cosine ≥ threshold → treat as cache hit
+    semantic_max_entries:  1024
+    lru_size:              2048
+
+  # ── Streaming / progressive UX ─────────────────────────────────────────
+  stream:
+    # When true, /suggest/stream emits a fast "vector" event first and a
+    # follow-up "rerank" event only if an LLM rerank actually runs.
+    progressive: true
+    # If the deterministic top-1 score is already this high, skip LLM
+    # rerank entirely even on the streaming path.
+    skip_llm_if_score_above: 0.90
+
+# ---------------------------------------------------------------------------
+# Eval-only sections (left intact for utils/eval.py and utils/diagram_eval.py)
+# ---------------------------------------------------------------------------
+prompts:
+  - name: default
+    system: ./final_prompts/text_prompt.md
+    followup: null
+
+diagram_prompts:
+  - name: default
+    variables: ./final_prompts/figure_prompt.md
+    edges:     ./final_prompts/figure_prompt.md

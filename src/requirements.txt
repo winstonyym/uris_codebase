@@ -1,0 +1,16 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pyyaml>=6.0
+neo4j>=5.20
+openai>=1.40
+anthropic>=0.34
+sse-starlette>=2.1
+numpy>=1.26
+python-dotenv>=1.0
+# Optional — used by graph_rag.cache when REDIS_URL is set. The import is
+# guarded; the service runs fine without Redis (in-process LRU only).
+redis>=5.0
+# CA bundle for TLS Redis (rediss://) — macOS Python can't resolve the
+# system trust store, so we point redis-py at certifi.where().
+certifi>=2024.2.2
