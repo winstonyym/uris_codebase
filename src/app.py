@@ -25,19 +25,19 @@ from typing import Any, Dict
 # Ensure relative-package imports work even when uvicorn launches us oddly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-
+from neo4j import GraphDatabase
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from graph_rag.causal import CausalReasoner
-from graph_rag.chat_agent import ChatAgent
-from graph_rag.config import load_config
-from graph_rag.embeddings import make_embedder
-from graph_rag.llm_router import LLMRouter
-from graph_rag.neo4j_client import Neo4jClient
-from graph_rag.recommender import Recommender
-from graph_rag.schemas import (
+from src.causal import CausalReasoner
+from src.chat_agent import ChatAgent
+from src.config import load_config
+from src.embeddings import make_embedder
+from src.llm_router import LLMRouter
+from src.neo4j_client import Neo4jClient
+from src.recommender import Recommender
+from src.schemas import (
     CausalQueryRequest,
     CausalQueryResponse,
     ChatRequest,
@@ -48,14 +48,17 @@ from graph_rag.schemas import (
 )
 
 from dotenv import load_dotenv  # noqa: E402
-# Important: override=False so a key already exported in the user's shell
-# wins over a possibly-stale value in .env (avoids the classic
-# "I rotated my key but the service still uses the old one" 401).
 load_dotenv(override=False)
 
 LOG = logging.getLogger("graph_rag.app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s  %(message)s")
 
+# driver = GraphDatabase.driver(
+#     os.environ["NEO4J_URI"],
+#     auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]),
+# )
+
+# driver.verify_connectivity()
 
 # ── Lifespan: build all singletons once and reuse them ───────────────
 
@@ -111,6 +114,10 @@ app.add_middleware(
 
 
 # ── Routes ────────────────────────────────────────────────────────────
+
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
 
 @app.get("/health")
 def health() -> Dict[str, Any]:

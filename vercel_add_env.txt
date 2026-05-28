@@ -1,0 +1,36 @@
+vercel env add NEO4J_URI production --sensitive
+vercel env add NEO4J_URI preview --sensitive
+vercel env add NEO4J_URI development
+
+vercel env add NEO4J_USERNAME production --sensitive
+vercel env add NEO4J_USERNAME preview --sensitive
+vercel env add NEO4J_USERNAME development
+
+vercel env add NEO4J_PASSWORD production --sensitive
+vercel env add NEO4J_PASSWORD preview --sensitive
+vercel env add NEO4J_PASSWORD development
+
+vercel env add NEO4J_DATABASE production --sensitive
+vercel env add NEO4J_DATABASE preview --sensitive
+vercel env add NEO4J_DATABASE development
+
+vercel env add OPENAI_API_KEY production --sensitive
+vercel env add OPENAI_API_KEY preview --sensitive
+vercel env add OPENAI_API_KEY development
+
+vercel env add ANTHROPIC_API_KEY production --sensitive
+vercel env add ANTHROPIC_API_KEY preview --sensitive
+vercel env add ANTHROPIC_API_KEY development
+
+vercel env add GOOGLE_API_KEY production --sensitive
+vercel env add GOOGLE_API_KEY preview --sensitive
+vercel env add GOOGLE_API_KEY development
+
+vercel env add DEEPSEEK_API_KEY production --sensitive
+vercel env add DEEPSEEK_API_KEY preview --sensitive
+vercel env add DEEPSEEK_API_KEY development
+
+vercel env add GROQ_API_KEY production --sensitive
+vercel env add GROQ_API_KEY preview --sensitive
+vercel env add GROQ_API_KEY development
+
