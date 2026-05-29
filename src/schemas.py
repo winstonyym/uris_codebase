@@ -39,7 +39,6 @@ class CanvasState(BaseModel):
 
 
 # ── /suggest ───────────────────────────────────────────────────────────
-
 class ProvenanceSnippet(BaseModel):
     paper_id: str
     page: Optional[int] = None

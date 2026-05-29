@@ -294,7 +294,7 @@ class CausalReasoner:
             ],
             "loops_involved": loops_involved,
         }
-        from utils.llm_client import call_with_retries
+        from src.llm_client import call_with_retries
         try:
             return call_with_retries(client, sys_prompt, json.dumps(user_payload), retries=1).strip()
         except Exception as e:

@@ -143,9 +143,8 @@ def stats() -> Dict[str, Any]:
 
 import re as _re   # local alias so we don't reshuffle the imports above
 
-_LOGS_DIR = Path(__file__).resolve().parent / "logs"
-_LOGS_DIR.mkdir(exist_ok=True)
-
+_LOGS_DIR = Path("/tmp/logs")
+_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 def _safe_slug(s: str, limit: int = 60) -> str:
     return _re.sub(r"[^A-Za-z0-9_-]+", "_", s or "")[:limit] or "anon"

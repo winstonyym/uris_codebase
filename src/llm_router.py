@@ -26,7 +26,7 @@ class LLMRouter:
 
     def get(self, component: str):
         """Return an `LLMClient` (with `.complete(system, user)` interface)."""
-        from utils.llm_client import make_client
+        from src.llm_client import make_client
         with self._lock:
             if component not in self._cache:
                 spec = self._cfg.model_spec_for(component)

@@ -762,7 +762,7 @@ class Recommender:
             ),
             "schema": {"scored": [{"id": "string", "alpha": "number 0..1", "rationale": "string|null"}]},
         })
-        from utils.llm_client import call_with_retries, extract_json
+        from src.llm_client import call_with_retries, extract_json
         raw = call_with_retries(client, sys_prompt, user_prompt, retries=1)
         data = extract_json(raw)
         scored = data.get("scored") or []

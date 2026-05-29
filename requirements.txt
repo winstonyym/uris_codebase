@@ -1,8 +1,8 @@
-fastapi>=0.115
-uvicorn[standard]>=0.30
-pydantic>=2.7
+fastapi
+uvicorn
+pydantic
 pyyaml>=6.0
-neo4j>=5.20
+neo4j
 openai>=1.40
 anthropic>=0.34
 sse-starlette>=2.1

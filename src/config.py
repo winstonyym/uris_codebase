@@ -95,7 +95,7 @@ class Config:
         Falls back to a thin stub if the model name isn't in the catalogue,
         assuming an anthropic backend (the most common default).
         """
-        from utils.llm_client import ModelSpec  # imported lazily — sys.path was set above
+        from src.llm_client import ModelSpec  # imported lazily — sys.path was set above
 
         if component not in self.components:
             raise KeyError(
