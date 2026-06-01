@@ -25,13 +25,15 @@ from typing import Any, Dict
 # Ensure relative-package imports work even when uvicorn launches us oddly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from neo4j import GraphDatabase
-from fastapi import FastAPI, HTTPException, Request
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from src.causal import CausalReasoner
 from src.chat_agent import ChatAgent
+from src.loop_chat import LoopAssistant
+from src import r2_uploader
 from src.config import load_config
 from src.embeddings import make_embedder
 from src.llm_router import LLMRouter
@@ -43,22 +45,20 @@ from src.schemas import (
     ChatRequest,
     ChatResponse,
     LogRequest,
+    LoopChatRequest,
     SuggestRequest,
     SuggestResponse,
 )
 
 from dotenv import load_dotenv  # noqa: E402
+# Important: override=False so a key already exported in the user's shell
+# wins over a possibly-stale value in .env (avoids the classic
+# "I rotated my key but the service still uses the old one" 401).
 load_dotenv(override=False)
 
 LOG = logging.getLogger("graph_rag.app")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s  %(message)s")
 
-# driver = GraphDatabase.driver(
-#     os.environ["NEO4J_URI"],
-#     auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]),
-# )
-
-# driver.verify_connectivity()
 
 # ── Lifespan: build all singletons once and reuse them ───────────────
 
@@ -79,6 +79,7 @@ async def lifespan(app: FastAPI):
     causal = CausalReasoner(cfg, router)
     recommender = Recommender(cfg, neo, embedder, router)
     chat = ChatAgent(cfg, router, causal_reasoner=causal)
+    loop_chat = LoopAssistant(cfg, router)
 
     # Warm the in-memory KG indices + caches eagerly so the first /suggest
     # call doesn't pay the load cost. Falls back to lazy-load if Neo4j is
@@ -95,6 +96,7 @@ async def lifespan(app: FastAPI):
     app.state.recommender = recommender
     app.state.causal = causal
     app.state.chat = chat
+    app.state.loop_chat = loop_chat
     LOG.info("Graph-RAG service ready.")
     try:
         yield
@@ -116,8 +118,10 @@ app.add_middleware(
 # ── Routes ────────────────────────────────────────────────────────────
 
 @app.get("/")
-def health_check():
+def root() -> Dict[str, str]:
+    """Root health probe — Vercel pings this to confirm the function is live."""
     return {"status": "ok"}
+
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
@@ -126,6 +130,7 @@ def health() -> Dict[str, Any]:
         "status": "ok",
         "neo4j": cfg.settings.neo4j_uri,
         "components": {k: v.model for k, v in cfg.components.items()},
+        "r2": r2_uploader.status(),
     }
 
 
@@ -143,16 +148,29 @@ def stats() -> Dict[str, Any]:
 
 import re as _re   # local alias so we don't reshuffle the imports above
 
+# On Vercel the only writable path is /tmp — anywhere else is read-only,
+# so /tmp/logs is the canonical local-append target. The R2 mirror keeps
+# the data durable across the ephemeral function lifecycle.
 _LOGS_DIR = Path("/tmp/logs")
 _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _safe_slug(s: str, limit: int = 60) -> str:
     return _re.sub(r"[^A-Za-z0-9_-]+", "_", s or "")[:limit] or "anon"
 
 
 @app.post("/log")
-def log_events(req: LogRequest) -> Dict[str, Any]:
+def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
     """Append a batch of activity events to this session's JSONL log file.
+
+    Two-tier durability:
+      1. Local append (sync, in-request) — fast, atomic per-line on POSIX,
+         the source of truth in this process.
+      2. Cloudflare R2 upload (background, best-effort) — uploads the
+         entire updated session file under
+         `sessions/<YYYY-MM-DD>/<user>_<session>.jsonl`. Never blocks
+         the response; if R2 is unreachable or unconfigured, the local
+         path keeps working.
 
     Each event is written as a single JSON object on its own line, with
     the session metadata duplicated alongside so the file is self-
@@ -178,7 +196,20 @@ def log_events(req: LogRequest) -> Dict[str, Any]:
     except OSError as e:
         LOG.exception("/log write failed for %s", path)
         raise HTTPException(status_code=500, detail=f"log write failed: {e}")
-    return {"ok": True, "written": len(req.events), "file": fname}
+
+    # Mirror to R2 — async, never blocks the response, never raises.
+    r2_synced = False
+    if r2_uploader.is_enabled():
+        r2_key = r2_uploader.build_session_key(req.user_id, req.session_id, req.started_at)
+        background.add_task(r2_uploader.upload_file, path, r2_key)
+        r2_synced = True
+
+    return {
+        "ok": True,
+        "written": len(req.events),
+        "file": fname,
+        "r2_synced": r2_synced,
+    }
 
 
 @app.post("/suggest", response_model=SuggestResponse)
@@ -251,6 +282,46 @@ async def chat_stream(req: ChatRequest, request: Request):
                     anyio.from_thread.run(send.send, (kind, data))
             except Exception as e:  # pragma: no cover
                 LOG.exception("/chat/stream failed")
+                anyio.from_thread.run(send.send, ("error", str(e)))
+            finally:
+                anyio.from_thread.run(send.aclose)
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(anyio.to_thread.run_sync, produce)
+            async for kind, data in receive:
+                yield {"event": kind, "data": data}
+
+        yield {"event": "done_meta", "data": str(int((time.perf_counter() - t0) * 1000))}
+
+    return EventSourceResponse(event_gen())
+
+
+@app.post("/loop-chat/stream")
+async def loop_chat_stream(req: LoopChatRequest, request: Request):
+    """Scope-bound, read-only chat for the Visualise tab.
+
+    The generator in `loop_chat.LoopAssistant.respond_stream` yields
+    ("delta", text) and ("done", final_text). We re-emit them as SSE
+    events of the same names; the frontend parses ``delta`` as
+    ``{text: "..."}`` for symmetry with /chat/stream.
+    """
+    import anyio
+
+    async def event_gen():
+        t0 = time.perf_counter()
+        yield {"event": "thinking", "data": "{}"}
+        send, receive = anyio.create_memory_object_stream(64)
+
+        def produce():
+            try:
+                for kind, payload in app.state.loop_chat.respond_stream(req):
+                    if kind == "delta":
+                        data = json.dumps({"text": payload})
+                    else:  # done
+                        data = json.dumps({"reply": payload})
+                    anyio.from_thread.run(send.send, (kind, data))
+            except Exception as e:
+                LOG.exception("/loop-chat/stream failed")
                 anyio.from_thread.run(send.send, ("error", str(e)))
             finally:
                 anyio.from_thread.run(send.aclose)

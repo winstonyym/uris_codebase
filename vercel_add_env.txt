@@ -34,3 +34,22 @@ vercel env add GROQ_API_KEY production --sensitive
 vercel env add GROQ_API_KEY preview --sensitive
 vercel env add GROQ_API_KEY development
 
+vercel env add R2_ACCOUNT_ID production --sensitive
+vercel env add R2_ACCOUNT_ID preview --sensitive
+vercel env add R2_ACCOUNT_ID development
+
+vercel env add R2_TOKEN_VALUE production --sensitive
+vercel env add R2_TOKEN_VALUE preview --sensitive
+vercel env add R2_TOKEN_VALUE development
+
+vercel env add R2_ACCESS_KEY_ID production --sensitive
+vercel env add R2_ACCESS_KEY_ID preview --sensitive
+vercel env add R2_ACCESS_KEY_ID development
+
+vercel env add R2_SECRET_ACCESS_KEY production --sensitive
+vercel env add R2_SECRET_ACCESS_KEY preview --sensitive
+vercel env add R2_SECRET_ACCESS_KEY development
+
+vercel env add R2_BUCKET_NAME production --sensitive
+vercel env add R2_BUCKET_NAME preview --sensitive
+vercel env add R2_BUCKET_NAME development

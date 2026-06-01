@@ -7,8 +7,11 @@ chat-completions APIs (DeepSeek, Qwen, Gemini-OpenAI-mode, vLLM, …):
   * remove_node    — remove a node and incident edges
   * add_edge       — propose a new signed edge
   * remove_edge    — remove an edge
-  * query_effect   — invoke the causal reasoner for "what if X increases?"
   * list_canvas    — read-only inspection of current canvas state
+
+The Diagram Assistant is deliberately scoped to STRUCTURE only. Causal
+interpretation, "what-if" questions, and loop tracing belong to the
+LoopAssistant on the Visualise tab (graph_rag/loop_chat.py).
 
 Mutations are *staged* rather than applied: each tool call returns a
 `PendingMutation` object that the frontend renders as a confirm/reject
@@ -54,46 +57,69 @@ MAX_NEW_NODES = 2
 MAX_STEPS = 5
 
 
-SYSTEM_PROMPT = f"""You are an assistant embedded in a causal-loop diagram (CLD) editor.
+SYSTEM_PROMPT = f"""You are the Diagram Assistant inside a causal-loop diagram (CLD) editor.
 
-The user is constructing a system-dynamics model and may ask you to:
-  • Add or remove nodes ("variables") on the canvas.
-  • Add or remove signed causal edges (polarity '+' or '-').
-  • Explain the effect of one variable on another via `query_effect`.
-  • Inspect the current canvas with `list_canvas`.
+YOUR SCOPE IS STRICTLY LIMITED TO STRUCTURAL EDITS. You may only:
+  • Add a node (variable) to the canvas.
+  • Remove a node (and its incident edges) from the canvas.
+  • Add a signed directed edge between two existing nodes.
+  • Remove an edge between two existing nodes.
+  • Inspect the current canvas with `list_canvas` when you need context.
 
-When the user requests a mutation, ALWAYS use the matching tool — never describe
-the change in prose alone. The tool's result is shown to the user as a "pending
-diff" they can accept or reject. After calling tools, give a short conversational
-reply (≤2 sentences) describing what you've staged.
+YOU MUST NOT:
+  • Explain or interpret what the diagram MEANS.
+  • Trace causal paths, predict effects ("what if X increases?"), describe
+    feedback loops, or comment on relationships between variables.
+  • Speculate about real-world dynamics.
+
+If the user asks for any kind of interpretation, analysis, "what-if" question,
+loop explanation, or anything that is not a structural edit, you MUST politely
+decline in 1-2 sentences and direct them to the Loop Assistant on the
+**Visualise** tab, e.g.:
+
+    "I can only add or remove nodes and edges here. For questions about how
+    variables affect each other, switch to the Visualise tab and ask the
+    Loop Assistant."
+
+When the user requests a valid mutation, ALWAYS use the matching tool — never
+describe the change in prose alone. The tool's result is shown to the user as
+a "pending diff" they can accept or reject. After calling tools, give a short
+conversational reply (≤2 sentences) describing what you've staged.
 
 IMPORTANT constraints:
   • Add AT MOST {MAX_NEW_NODES} new nodes per request. If the user asks for more,
     add the {MAX_NEW_NODES} most important ones and say so in your reply.
   • Strongly prefer connecting to / reusing variables ALREADY on the canvas
     rather than inventing new nodes. Only add a node when nothing suitable exists.
-  • Choose edge polarity from common-sense system dynamics.
-
-If the user asks a "what if" question, call `query_effect`. Do not invent paths."""
+  • Choose edge polarity from common-sense system dynamics."""
 
 
 def _build_tools() -> List[Dict[str, Any]]:
     return [
         {
             "name": "add_node",
-            "description": "Stage a new node (variable) to add to the canvas.",
+            "description": (
+                "Stage a new node (variable) to add to the canvas. "
+                "Subsystem must be one of the 14 canonical values below; "
+                "this drives the node's colour on the diagram."
+            ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "label": {"type": "string"},
-                    "category": {
+                    "subsystem": {
                         "type": "string",
-                        "description": "Optional category label, e.g. 'policy', 'market', 'social'.",
+                        "description": "Canonical category the variable belongs to.",
+                        "enum": [
+                            "Demographics", "Land Use", "Housing", "Transportation",
+                            "Infrastructure", "Energy", "Utilities", "Environment",
+                            "Economy", "Governance", "Finance", "Health",
+                            "Social", "Others",
+                        ],
                     },
-                    "subsystem": {"type": "string"},
                     "description": {"type": "string"},
                 },
-                "required": ["label"],
+                "required": ["label", "subsystem"],
             },
         },
         {
@@ -134,19 +160,11 @@ def _build_tools() -> List[Dict[str, Any]]:
                 "required": ["source", "target"],
             },
         },
-        {
-            "name": "query_effect",
-            "description": "Compute the effect of changing one variable on another using the canvas graph.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "description": "Label or id of the variable that changes."},
-                    "target": {"type": "string", "description": "Label or id of the variable to observe."},
-                    "direction": {"type": "string", "enum": ["increase", "decrease"], "default": "increase"},
-                },
-                "required": ["source", "target"],
-            },
-        },
+        # `query_effect` was removed from the Diagram Assistant on
+        # purpose: interpretation / "what-if" Q&A is the Loop Assistant's
+        # job on the Visualise tab. The system prompt redirects users
+        # there. The dispatcher case below is kept for defence in depth
+        # (returns an error if the model ever tries to call it anyway).
         {
             "name": "list_canvas",
             "description": "Return the current canvas (read-only). Use sparingly; prefer reasoning from prior context.",
@@ -476,14 +494,17 @@ class ChatAgent:
                         f"per request. Connect to existing canvas nodes instead."
                     )
                 }, None
+            # Subsystem replaces the old `category` field on the canvas
+            # — it must come from the 14-value enum advertised by the
+            # tool above. Falls back to "Others" if the model forgets,
+            # which still resolves to a valid colour client-side.
             mut = PendingMutation(
                 id=f"m_{uuid.uuid4().hex[:8]}",
                 op="add_node",
                 payload={
                     "id": f"node_{uuid.uuid4().hex[:8]}",
                     "label": label,
-                    "category": args.get("category") or "other",
-                    "subsystem": args.get("subsystem") or "",
+                    "subsystem": args.get("subsystem") or "Others",
                     "description": args.get("description") or "",
                 },
                 summary=f"Add node “{label}”",
@@ -543,22 +564,16 @@ class ChatAgent:
             return {"status": "staged", "mutation_id": mut.id}, mut
 
         if name == "query_effect":
-            if self.causal is None:
-                return {"error": "causal reasoner not initialised"}, None
-            from .schemas import CausalQueryRequest
-            sid = _resolve_node(args.get("source", ""), canvas)
-            tid = _resolve_node(args.get("target", ""), canvas)
-            if not sid or not tid:
-                return {"error": "source or target not on canvas"}, None
-            direction = args.get("direction") or "increase"
-            res = self.causal.answer(CausalQueryRequest(
-                source=sid, target=tid, direction=direction, canvas=canvas,
-            ))
+            # Defensive refusal — the tool is no longer advertised to the
+            # model in `_build_tools`, but if a stale model call sneaks
+            # through we tell it explicitly that this scope belongs to
+            # the Loop Assistant on the Visualise tab.
             return {
-                "summary": res.summary,
-                "net_direction": res.net_direction,
-                "paths": [p.model_dump() for p in res.paths],
-                "loops_involved": res.loops_involved,
+                "error": (
+                    "Interpretation / what-if questions belong to the Loop "
+                    "Assistant on the Visualise tab — the Diagram Assistant "
+                    "only edits structure (add / remove nodes and edges)."
+                )
             }, None
 
         return {"error": f"unknown tool {name!r}"}, None

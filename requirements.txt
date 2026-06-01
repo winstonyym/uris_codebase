@@ -14,3 +14,7 @@ redis>=5.0
 # CA bundle for TLS Redis (rediss://) — macOS Python can't resolve the
 # system trust store, so we point redis-py at certifi.where().
 certifi>=2024.2.2
+# Optional — used by src.r2_uploader when R2_* env vars are set
+# (Cloudflare R2 is S3-compatible). The import is guarded; missing
+# package or missing env both degrade to local-file-only logging.
+boto3>=1.34

@@ -39,6 +39,7 @@ class CanvasState(BaseModel):
 
 
 # ── /suggest ───────────────────────────────────────────────────────────
+
 class ProvenanceSnippet(BaseModel):
     paper_id: str
     page: Optional[int] = None
@@ -147,6 +148,32 @@ class ChatResponse(BaseModel):
     """Non-streaming variant. The /chat endpoint streams these fields as SSE."""
     reply: str
     mutations: List[PendingMutation] = Field(default_factory=list)
+
+
+# ── /loop-chat ─────────────────────────────────────────────────────────
+
+class SelectionScope(BaseModel):
+    """The Visualise tab's current focus — feeds the loop-chat system
+    prompt so the LLM can refuse to discuss anything outside this view.
+    """
+    # Loop currently highlighted in the Loop badge bar, or "ALL"
+    selected_loop_id: Optional[str] = None
+    selected_loop_name: Optional[str] = None
+    selected_loop_type: Optional[str] = None       # "R" or "B"
+    selected_loop_link_pairs: List[List[str]] = Field(default_factory=list)
+    # Subsystem filter (substring of `subsystem` field on each node), or "ALL"
+    active_subsystem: Optional[str] = None
+    # Optional: the user clicked a specific node/edge
+    selected_item_kind: Optional[Literal["node", "link"]] = None
+    selected_item_label: Optional[str] = None
+    # Ids of the nodes currently *visible* on screen (after filters)
+    visible_node_ids: List[str] = Field(default_factory=list)
+
+
+class LoopChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    canvas: CanvasState
+    scope: SelectionScope
 
 
 # ── /log ───────────────────────────────────────────────────────────────
