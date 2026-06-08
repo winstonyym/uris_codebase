@@ -39,7 +39,13 @@ class OpenAIEmbedder:
         if not texts:
             return []
         # OpenAI API supports batching by passing a list.
-        resp = self._client.embeddings.create(model=self.spec.model, input=texts)
+        kwargs = {"model": self.spec.model, "input": texts}
+        # text-embedding-3-* support reduced output dimensionality via the
+        # `dimensions` param (e.g. 512). Older models (ada-002) ignore/reject
+        # it, so only send it when explicitly configured.
+        if self.spec.dimensions:
+            kwargs["dimensions"] = int(self.spec.dimensions)
+        resp = self._client.embeddings.create(**kwargs)
         return [d.embedding for d in resp.data]
 
 

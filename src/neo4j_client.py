@@ -55,11 +55,43 @@ class Neo4jClient:
                 dim=int(dimensions),
             )
 
+    def drop_vector_index(self, vector_index_name: str) -> None:
+        """Drop the vector index if it exists.
+
+        Needed when the embedding dimensionality changes (e.g. 1536 → 512):
+        `CREATE ... IF NOT EXISTS` will NOT alter an existing index, so the
+        old-dimension index must be dropped before re-creating it.
+        """
+        with self.session() as s:
+            s.run(f"DROP INDEX {vector_index_name} IF EXISTS")
+
+    def clear_graph(self, batch: int = 5000) -> int:
+        """Delete ALL KGNode nodes and their relationships.
+
+        Uses CALL { … } IN TRANSACTIONS so large graphs are removed in
+        bounded batches rather than one giant transaction. Returns the
+        number of nodes that were present before deletion.
+        """
+        with self.session() as s:
+            total = s.run("MATCH (n:KGNode) RETURN count(n) AS n").single()["n"]
+            # batch is interpolated (int-sanitised) — IN TRANSACTIONS OF
+            # doesn't accept a query parameter for the batch size.
+            s.run(
+                "MATCH (n:KGNode) "
+                f"CALL {{ WITH n DETACH DELETE n }} IN TRANSACTIONS OF {int(batch)} ROWS"
+            ).consume()
+        return int(total)
+
     # ── Writes ─────────────────────────────────────────────────────────
 
-    def upsert_nodes(self, nodes: List[Dict[str, Any]]) -> int:
+    def upsert_nodes(self, nodes: List[Dict[str, Any]], batch: int = 1000) -> int:
         """Bulk upsert KG nodes. Each dict needs id/label/category and may
-        include aliases, description, embedding, provenance."""
+        include aliases, description, embedding, provenance.
+
+        Chunked into `batch`-sized transactions so large graphs (tens of
+        thousands of nodes, each carrying a 512-float embedding) don't blow
+        a single transaction's memory/size limits.
+        """
         if not nodes:
             return 0
         q = """
@@ -73,12 +105,22 @@ class Neo4jClient:
             n.embedding   = row.embedding
         RETURN count(n) AS n
         """
+        total = 0
+        rows = list(nodes)
         with self.session() as s:
-            res = s.run(q, rows=list(nodes))
-            return res.single()["n"]
+            for start in range(0, len(rows), batch):
+                res = s.run(q, rows=rows[start : start + batch])
+                total += res.single()["n"]
+        return total
 
-    def upsert_edges(self, edges: List[Dict[str, Any]]) -> int:
-        """Bulk upsert directed signed edges as :CAUSES relationships."""
+    def upsert_edges(self, edges: List[Dict[str, Any]], batch: int = 2000) -> int:
+        """Bulk upsert directed signed edges as :CAUSES relationships.
+
+        Chunked into `batch`-sized transactions for the same reason as
+        upsert_nodes. Edges whose endpoints are missing are silently skipped
+        by the MATCH (they simply don't match), so counts reflect only edges
+        actually written.
+        """
         if not edges:
             return 0
         q = """
@@ -90,9 +132,13 @@ class Neo4jClient:
             r.provenance = row.provenance_json
         RETURN count(r) AS n
         """
+        total = 0
+        rows = list(edges)
         with self.session() as s:
-            res = s.run(q, rows=list(edges))
-            return res.single()["n"]
+            for start in range(0, len(rows), batch):
+                res = s.run(q, rows=rows[start : start + batch])
+                total += res.single()["n"]
+        return total
 
     # ── Reads ──────────────────────────────────────────────────────────
 

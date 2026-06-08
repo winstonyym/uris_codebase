@@ -85,7 +85,30 @@ def _normalize_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
+def _coerce_sign(raw: Any) -> str:
+    """Map a KG edge sign onto the canvas polarity literal ('+' or '-').
+
+    merged_kg.json edges can be '+', '-', or 'unknown' (genuinely
+    undetermined polarity). The frontend CLD only models '+'/'-', so we
+    keep '-' when explicit and default everything else — including
+    'unknown' — to '+', the conventional default for an unlabeled causal
+    link. This guarantees the value always satisfies the response schema.
+    """
+    return "-" if str(raw).strip() == "-" else "+"
+
+
 def _coerce_provenance(raw: Any) -> List[ProvenanceSnippet]:
+    """Normalise the many provenance shapes in the KG into snippets.
+
+    Tolerated inputs (so a single odd record never 500s the endpoint):
+      • JSON string  → parsed first.
+      • list[dict]   → node-style provenance (as before).
+      • dict         → edge-style provenance, e.g.
+                       {"evidence": [ {...}, ... ], "relationship": {...}}
+                       — we unwrap `evidence`; a bare dict is treated as one
+                       entry.
+      • anything else / non-dict elements → skipped.
+    """
     if not raw:
         return []
     if isinstance(raw, str):
@@ -93,14 +116,23 @@ def _coerce_provenance(raw: Any) -> List[ProvenanceSnippet]:
             raw = json.loads(raw)
         except Exception:
             return []
+    # Edge provenance is a dict in merged_kg.json; unwrap its evidence list.
+    if isinstance(raw, dict):
+        evidence = raw.get("evidence")
+        raw = evidence if isinstance(evidence, list) else [raw]
+    if not isinstance(raw, list):
+        return []
+
     out: List[ProvenanceSnippet] = []
     for p in raw[:5]:
+        if not isinstance(p, dict):
+            continue
         out.append(ProvenanceSnippet(
-            paper_id=p.get("paper_id", ""),
+            paper_id=p.get("paper_id") or p.get("paper_title") or "",
             page=p.get("page"),
             figure_id=p.get("figure_id"),
             source=p.get("source"),
-            quote=p.get("source_quote"),
+            quote=p.get("source_quote") or p.get("quote"),
         ))
     return out
 
@@ -425,9 +457,12 @@ class Recommender:
             cands  = [_candidate_from_cacheable(d) for d in cached.get("candidates", [])]
             return anchor, conf, cands, None
 
-        # 2) Embedding cache, else call the API
+        # 2) Embedding cache, else call the API. Guard against stale cached
+        #    vectors of a different dimensionality (e.g. left over from a
+        #    previous embedding model / dimensions setting) — re-embed if the
+        #    cached length no longer matches the active embedder.
         emb = self._emb_cache.get(text_key)
-        if emb is None:
+        if emb is None or len(emb) != self.embedder.dimensions:
             emb = self.embedder.embed([text])[0]
             self._emb_cache.set(text_key, emb)
 
@@ -663,7 +698,7 @@ class Recommender:
             out[rec["kid"]].append(SuggestedEdgeFromNew(
                 canvas_node_id=canvas_id,
                 direction=direction,
-                polarity=rec["sign"],
+                polarity=_coerce_sign(rec["sign"]),
                 weight=int(rec["weight"]),
                 provenance=_coerce_provenance(rec["prov"]),
             ))
@@ -711,7 +746,7 @@ class Recommender:
             alpha = round(min(0.95, 0.4 + 0.1 * weight), 3)
             proposals.append(SuggestedCanvasEdge(
                 source=src_canvas, target=tgt_canvas,
-                polarity=rec["sign"], weight=weight,
+                polarity=_coerce_sign(rec["sign"]), weight=weight,
                 alpha=alpha,
                 rationale=f"Direct KG link (weight {weight})",
                 provenance=_coerce_provenance(rec["prov"]),
