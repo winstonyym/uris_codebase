@@ -132,7 +132,10 @@ def _safe(s: str, limit: int = 80) -> str:
 def build_session_key(user_id: str, session_id: str, started_at: Optional[str] = None) -> str:
     """Object key under which this session's JSONL is stored.
 
-    Layout: `sessions/<YYYY-MM-DD>/<user_id>_<session_id>.jsonl`
+    Layout: `sessions/<YYYY-MM-DD>/<user_id>_<session_id>.json`
+
+    Stored as a single pretty-printed JSON document (not JSONL) so the
+    object previews cleanly in the Cloudflare R2 dashboard.
 
     Date-partitioning by `started_at` (falls back to today UTC) makes
     the bucket browsable as it grows. The same key is reused on every
@@ -149,7 +152,28 @@ def build_session_key(user_id: str, session_id: str, started_at: Optional[str] =
             day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     else:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return f"sessions/{day}/{_safe(user_id)}_{_safe(session_id)}.jsonl"
+    return f"sessions/{day}/{_safe(user_id)}_{_safe(session_id)}.json"
+
+
+def read_object(key: str) -> Optional[bytes]:
+    """Fetch an object's bytes from R2, or None if missing/unavailable.
+
+    Used to seed the per-session JSON document when this (possibly cold)
+    instance has no local copy yet, so accumulated events survive across
+    serverless instances. Never raises.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+    bucket = (os.environ.get("R2_BUCKET_NAME") or "").strip()
+    if not bucket:
+        return None
+    try:
+        resp = client.get_object(Bucket=bucket, Key=key)
+        return resp["Body"].read()
+    except Exception as e:  # includes NoSuchKey
+        LOG.debug("R2 get miss (%s): %s", key, e)
+        return None
 
 
 def upload_file(local_path: Path, key: str) -> bool:
@@ -174,7 +198,8 @@ def upload_file(local_path: Path, key: str) -> bool:
                 Bucket=bucket,
                 Key=key,
                 Body=f.read(),
-                ContentType="application/x-ndjson",
+                # JSON (not NDJSON) so the object previews in the R2 dashboard.
+                ContentType="application/json",
                 # Cache-Control: telemetry shouldn't be served, but in
                 # case anyone wires up a public view, keep it private.
                 CacheControl="no-store",

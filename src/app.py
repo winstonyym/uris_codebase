@@ -142,15 +142,18 @@ def stats() -> Dict[str, Any]:
 
 # ── Activity logging ──────────────────────────────────────────────────
 #
-# One JSONL file per (user, session) under graph_rag/logs/. Browser
-# clients post batches; this endpoint appends each event on its own
-# line so the files are tail-friendly and trivially parseable.
+# One JSON document per (user, session). Browser clients post batches;
+# this endpoint accumulates them into a single, pretty-printed JSON
+# object — session metadata at the top (including the beta access key id)
+# and an `events` array — so the file previews cleanly in the Cloudflare
+# R2 dashboard instead of being raw JSONL.
 
 import re as _re   # local alias so we don't reshuffle the imports above
+from datetime import datetime as _dt, timezone as _tz
 
 # On Vercel the only writable path is /tmp — anywhere else is read-only,
-# so /tmp/logs is the canonical local-append target. The R2 mirror keeps
-# the data durable across the ephemeral function lifecycle.
+# so /tmp/logs is the canonical local target. The R2 mirror keeps the
+# data durable across the ephemeral function lifecycle.
 _LOGS_DIR = Path("/tmp/logs")
 _LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -159,40 +162,77 @@ def _safe_slug(s: str, limit: int = 60) -> str:
     return _re.sub(r"[^A-Za-z0-9_-]+", "_", s or "")[:limit] or "anon"
 
 
+def _load_session_doc(path: Path, r2_key: str) -> Dict[str, Any]:
+    """Return this session's accumulated JSON doc.
+
+    Prefers the local /tmp copy; if absent (e.g. a cold serverless
+    instance), seeds from the existing R2 object so events accumulated by
+    earlier instances aren't lost. Falls back to a fresh doc. Never raises.
+    """
+    for source in (
+        lambda: path.read_bytes() if path.exists() else None,
+        lambda: r2_uploader.read_object(r2_key) if r2_uploader.is_enabled() else None,
+    ):
+        try:
+            raw = source()
+            if raw:
+                doc = json.loads(raw)
+                if isinstance(doc, dict) and isinstance(doc.get("events"), list):
+                    return doc
+        except Exception:
+            LOG.debug("session doc load failed, continuing", exc_info=True)
+    return {"events": []}
+
+
 @app.post("/log")
 def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
-    """Append a batch of activity events to this session's JSONL log file.
+    """Accumulate a batch of activity events into this session's JSON log.
 
     Two-tier durability:
-      1. Local append (sync, in-request) — fast, atomic per-line on POSIX,
-         the source of truth in this process.
+      1. Local read-modify-write (sync, in-request) under /tmp — the
+         working copy for this instance, seeded from R2 when cold.
       2. Cloudflare R2 upload (background, best-effort) — uploads the
-         entire updated session file under
-         `sessions/<YYYY-MM-DD>/<user>_<session>.jsonl`. Never blocks
-         the response; if R2 is unreachable or unconfigured, the local
-         path keeps working.
+         whole updated JSON document under
+         `sessions/<YYYY-MM-DD>/<user>_<session>.json`. Never blocks the
+         response; if R2 is unreachable or unconfigured, the local path
+         keeps working.
 
-    Each event is written as a single JSON object on its own line, with
-    the session metadata duplicated alongside so the file is self-
-    describing even if a downstream tool processes one event at a time.
+    The document is a single JSON object: session metadata at the top
+    (variant + beta access key id included) and an `events` array.
     """
     if not req.session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
-    fname = f"{_safe_slug(req.user_id)}_{_safe_slug(req.session_id, 80)}.jsonl"
+
+    fname = f"{_safe_slug(req.user_id)}_{_safe_slug(req.session_id, 80)}.json"
     path = _LOGS_DIR / fname
-    # Open in append mode — multiple concurrent writers would interleave
-    # whole lines safely on POSIX as long as each write is under PIPE_BUF.
+    r2_key = r2_uploader.build_session_key(req.user_id, req.session_id, req.started_at)
+
+    prior = _load_session_doc(path, r2_key)
+    events = prior.get("events") or []
+    for ev in req.events:
+        events.append({
+            "timestamp": ev.timestamp,
+            "event":     ev.event,
+            "payload":   ev.payload,
+        })
+
+    # Rebuild as an ordered document: session metadata first (so the beta
+    # access key id is right at the top of the R2 preview), events last.
+    doc = {
+        "session_id":    req.session_id,
+        "user_id":       req.user_id,
+        "name":          req.name,
+        "variant":       req.variant,
+        "secure":        req.secure,
+        "access_key_id": req.access_key_id,   # beta access key (never the raw key)
+        "started_at":    req.started_at,
+        "updated_at":    _dt.now(_tz.utc).isoformat(),
+        "event_count":   len(events),
+        "events":        events,
+    }
+
     try:
-        with path.open("a", encoding="utf-8") as f:
-            for ev in req.events:
-                f.write(json.dumps({
-                    "timestamp":  ev.timestamp,
-                    "session_id": req.session_id,
-                    "user_id":    req.user_id,
-                    "name":       req.name,
-                    "event":      ev.event,
-                    "payload":    ev.payload,
-                }, ensure_ascii=False) + "\n")
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
         LOG.exception("/log write failed for %s", path)
         raise HTTPException(status_code=500, detail=f"log write failed: {e}")
@@ -200,13 +240,13 @@ def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
     # Mirror to R2 — async, never blocks the response, never raises.
     r2_synced = False
     if r2_uploader.is_enabled():
-        r2_key = r2_uploader.build_session_key(req.user_id, req.session_id, req.started_at)
         background.add_task(r2_uploader.upload_file, path, r2_key)
         r2_synced = True
 
     return {
         "ok": True,
         "written": len(req.events),
+        "event_count": doc["event_count"],
         "file": fname,
         "r2_synced": r2_synced,
     }
