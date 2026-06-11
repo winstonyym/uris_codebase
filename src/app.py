@@ -46,6 +46,8 @@ from src.schemas import (
     ChatResponse,
     LogRequest,
     LoopChatRequest,
+    LoopDescribeRequest,
+    LoopDescribeResponse,
     SuggestRequest,
     SuggestResponse,
 )
@@ -259,6 +261,69 @@ def suggest(req: SuggestRequest) -> SuggestResponse:
     except Exception as e:
         LOG.exception("/suggest failed")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/loop-describe", response_model=LoopDescribeResponse)
+def loop_describe(req: LoopDescribeRequest) -> LoopDescribeResponse:
+    """Name + describe a single feedback loop the frontend just detected.
+
+    The loop's *type* (R / B) is computed deterministically on the client
+    from edge-sign parity and passed in — the LLM only writes prose, it
+    never re-classifies. Uses the `loop_describer` component (deepseek-v4-flash
+    by default). If the LLM call or JSON parse fails, we fall back to a
+    deterministic description so the UI always has something to show.
+    """
+    type_word = "reinforcing" if req.type == "R" else "balancing"
+
+    # Render the cycle as a readable signed walk, e.g.
+    #   New house price -→ Real family demand  (the arrow carries the sign)
+    walk_lines = []
+    for e in req.edges:
+        sign = "+" if e.polarity == "+" else "−"
+        walk_lines.append(f"  {e.source_label} {sign}→ {e.target_label}")
+    walk = "\n".join(walk_lines) if walk_lines else "  (no edges)"
+    n_neg = sum(1 for e in req.edges if e.polarity == "-")
+
+    system = (
+        "You are a system-dynamics expert. Given the edges of ONE feedback "
+        "loop in a causal loop diagram, write a short title and a 1-2 "
+        "sentence plain-English explanation of how the loop behaves. "
+        "The loop's type is already decided for you — do not contradict it. "
+        "A REINFORCING (R) loop amplifies change; a BALANCING (B) loop "
+        "counteracts it. Respond ONLY with a JSON object of the form "
+        '{"name": "...", "description": "..."}. No markdown, no extra keys.'
+    )
+    user = (
+        f"Loop id: {req.loop_id}\n"
+        f"Loop type: {req.type} ({type_word}; it has {n_neg} negative link(s))\n"
+        f"Edges (in cycle order):\n{walk}\n\n"
+        "Write the JSON now."
+    )
+
+    # Deterministic fallback used if anything below fails.
+    fallback_name = f"{type_word.capitalize()} loop"
+    if req.edges:
+        nodes_in_order = [req.edges[0].source_label] + [e.target_label for e in req.edges[:-1]]
+        fallback_desc = (
+            f"A {type_word} loop linking "
+            + " → ".join(nodes_in_order)
+            + (". Change in any variable propagates around the loop and "
+               + ("amplifies itself." if req.type == "R" else "is counteracted."))
+        )
+    else:
+        fallback_desc = f"A {type_word} feedback loop."
+
+    try:
+        from src.llm_client import extract_json
+        _spec, client = app.state.router.get("loop_describer")
+        raw = client.complete(system, user)
+        data = extract_json(raw)
+        name = str(data.get("name") or fallback_name).strip()
+        description = str(data.get("description") or fallback_desc).strip()
+        return LoopDescribeResponse(name=name, description=description, type=req.type)
+    except Exception as e:
+        LOG.warning("/loop-describe falling back to deterministic text: %s", e)
+        return LoopDescribeResponse(name=fallback_name, description=fallback_desc, type=req.type)
 
 
 @app.post("/causal-query", response_model=CausalQueryResponse)

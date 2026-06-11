@@ -176,6 +176,37 @@ class LoopChatRequest(BaseModel):
     scope: SelectionScope
 
 
+# ── /loop-describe ─────────────────────────────────────────────────────
+
+class LoopEdgeItem(BaseModel):
+    """One directed signed edge in the cycle, with human labels resolved
+    so the LLM doesn't have to guess what an id means."""
+    source: str                         # node id
+    target: str                         # node id
+    source_label: str
+    target_label: str
+    polarity: Literal["+", "-"]
+
+
+class LoopDescribeRequest(BaseModel):
+    """Describe ONE feedback loop the frontend just detected.
+
+    `type` is the deterministic classification ("R" reinforcing / "B"
+    balancing) the frontend already computed from edge-sign parity; we
+    pass it in so the narration stays consistent with the badge the user
+    sees, and the LLM only writes prose — it never re-derives the type.
+    """
+    loop_id: str                                  # e.g. "R1" (display id)
+    type: Literal["R", "B"]
+    edges: List[LoopEdgeItem] = Field(default_factory=list)
+
+
+class LoopDescribeResponse(BaseModel):
+    name: str                                     # short human title
+    description: str                              # 1-2 sentence explanation
+    type: Literal["R", "B"]
+
+
 # ── /log ───────────────────────────────────────────────────────────────
 
 class LogEventItem(BaseModel):

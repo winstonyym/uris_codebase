@@ -135,6 +135,13 @@ components:
     model: claude-haiku-4.5
     temperature: 0.0
 
+  # Small/fast LLM that writes the one-line name + 1-2 sentence description
+  # for feedback loops the frontend detects on the fly. Kept on a flash model
+  # because it's called once per newly-formed loop and wants low latency.
+  loop_describer:
+    model: deepseek-v4-flash
+    temperature: 0.2
+
 # Graph-RAG runtime settings
 graph_rag:
   neo4j_uri: neo4j+s://f52f4095.databases.neo4j.io
@@ -145,14 +152,14 @@ graph_rag:
   merged_kg_path: ./merged_kg.json
   # Retrieval knobs
   top_k_vector: 25              # candidates pulled by vector search
-  top_k_final:  10              # after rerank, returned to UI
-  max_hops:     2               # graph-neighbour expansion radius
+  top_k_final:  5            # after rerank, returned to UI
+  max_hops:     1               # graph-neighbour expansion radius
   damping:      0.6             # per-hop weight decay for causal paths
   # Latency safety net: skip LLM rerank if N candidates are clearly distinct
-  skip_rerank_if_top_score_above: 0.92
+  skip_rerank_if_top_score_above: 0.7
   # Also skip when the margin between candidate scores is large enough that
   # reranking is unlikely to flip the ordering.
-  skip_rerank_if_margin_above:      0.18
+  skip_rerank_if_margin_above:      0.15
 
   # ── Caching ────────────────────────────────────────────────────────────
   # All caches are optional. Redis is used opportunistically: if REDIS_URL
@@ -174,7 +181,7 @@ graph_rag:
     progressive: true
     # If the deterministic top-1 score is already this high, skip LLM
     # rerank entirely even on the streaming path.
-    skip_llm_if_score_above: 0.90
+    skip_llm_if_score_above: 0.7
 
 # ---------------------------------------------------------------------------
 # Eval-only sections (left intact for utils/eval.py and utils/diagram_eval.py)
