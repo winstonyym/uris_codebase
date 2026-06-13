@@ -55,12 +55,12 @@ models:
     api_key_env: DEEPSEEK_API_KEY
     max_tokens: 16384
 
-  # - name: deepseek-v4-pro
-  #   backend: openai
-  #   model: deepseek-v4-pro
-  #   base_url: https://api.deepseek.com
-  #   api_key_env: DEEPSEEK_API_KEY
-  #   max_tokens: 32768
+  - name: deepseek-v4-pro
+    backend: openai
+    model: deepseek-v4-pro
+    base_url: https://api.deepseek.com
+    api_key_env: DEEPSEEK_API_KEY
+    max_tokens: 32768
 
   # - name: qwen3.6-flash
   #   backend: openai
@@ -128,18 +128,18 @@ components:
     temperature: 0.0
 
   chat_agent:
-    model: claude-haiku-4.5
+    model: deepseek-v4-pro
     temperature: 0.0
 
   causal_narrator:
-    model: claude-haiku-4.5
+    model: deepseek-v4-pro
     temperature: 0.0
 
   # Small/fast LLM that writes the one-line name + 1-2 sentence description
   # for feedback loops the frontend detects on the fly. Kept on a flash model
   # because it's called once per newly-formed loop and wants low latency.
   loop_describer:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.2
 
 # Graph-RAG runtime settings
@@ -150,16 +150,47 @@ graph_rag:
   neo4j_database: f52f4095
   vector_index_name: nodeLabelEmbedding
   merged_kg_path: ./merged_kg.json
-  # Retrieval knobs
-  top_k_vector: 25              # candidates pulled by vector search
-  top_k_final:  5            # after rerank, returned to UI
-  max_hops:     1               # graph-neighbour expansion radius
-  damping:      0.6             # per-hop weight decay for causal paths
-  # Latency safety net: skip LLM rerank if N candidates are clearly distinct
-  skip_rerank_if_top_score_above: 0.7
-  # Also skip when the margin between candidate scores is large enough that
-  # reranking is unlikely to flip the ordering.
-  skip_rerank_if_margin_above:      0.15
+  # ── Retrieval knobs ──────────────────────────────────────────────────
+  # Tuned for a balance of accuracy and latency. The two levers most worth
+  # tuning per-deployment are `max_hops` (accuracy↑ / latency↑) and
+  # `top_k_vector` (recall↑ / rerank cost↑).
+  #
+  top_k_vector: 30   # Vector-search recall pool. The reranker only ever sees
+                     # these, so anything outside this set can never be
+                     # suggested → size it for recall. 30 reliably contains the
+                     # right neighbours for a CLD-sized graph; below ~20 recall
+                     # drops, above ~40 you pay to rerank near-duplicates.
+  top_k_final: 8     # Hard ceiling on suggestions returned to the UI after
+                     # rerank — a precision/clutter knob. The UI asks for 3–8,
+                     # so 8 covers it without overwhelming the canvas. (Was 5,
+                     # which silently capped richer requests.) Truncation is
+                     # cheap; it doesn't change how many candidates get reranked.
+  max_hops: 2        # Graph-neighbour expansion radius around each matched
+                     # node. 1 = direct neighbours only (fast, but misses
+                     # indirect causal links); 2 captures neighbours-of-
+                     # neighbours, which materially improves suggestion quality
+                     # on causal diagrams. 2 is the accuracy/latency sweet spot
+                     # — drop to 1 only if strictly latency-bound; avoid 3+
+                     # (candidate set explodes on dense KGs).
+  damping: 0.6       # Per-hop decay on causal-path strength: a k-hop path is
+                     # weighted damping^k, so a 2-hop link counts 0.36× a direct
+                     # one. 0.6 keeps 2–3 hop paths influential without letting
+                     # long, weak chains dominate. <0.5 is near-sightedly local;
+                     # >0.7 lets distant noise leak in.
+  #
+  # ── Rerank skip heuristics (latency safety nets) ─────────────────────
+  # Each skips the slow LLM rerank when its outcome is near-certain, trading a
+  # negligible accuracy risk for a large latency win on easy queries.
+  #
+  skip_rerank_if_top_score_above: 0.90   # If the deterministic top candidate is
+                     # already this confident, the LLM almost never reorders it
+                     # — serve directly. 0.90 only short-circuits genuinely
+                     # unambiguous hits. (Was 0.7, which skipped rerank on many
+                     # medium-confidence queries and hurt accuracy.)
+  skip_rerank_if_margin_above: 0.15      # If the gap between the top two
+                     # candidates exceeds this, their order is unlikely to flip
+                     # under rerank, so skip it. 0.15 catches the common
+                     # "obvious winner" case while still reranking close calls.
 
   # ── Caching ────────────────────────────────────────────────────────────
   # All caches are optional. Redis is used opportunistically: if REDIS_URL
@@ -167,7 +198,7 @@ graph_rag:
   # in-process LRU caches. This makes the same image deployable to a
   # one-container free tier as well as a horizontally-scaled cluster.
   cache:
-    redis_url: "rediss://default:gQAAAAAAAfqyAAIgcDFkNmE1MjEyMzI2NDE0OGYxYTllNDNiYTcxZjA5NTY2MQ@organic-muskrat-129714.upstash.io:6379"
+    redis_url: "rediss://default:gQAAAAAAAfqyAAIgcDE5OTExODI4NDMyYzg0YjQzOGMzY2U4Y2ZkNzNmYWU1ZQ@organic-muskrat-129714.upstash.io:6379"
     embedding_ttl_sec:    86400  # query-text → embedding (1 day)
     response_ttl_sec:       300  # canonical (query, canvas) → response
     semantic_threshold:    0.97  # cosine ≥ threshold → treat as cache hit
