@@ -73,7 +73,112 @@ on screen. You must obey the following rules at all times:
      read-only Q&A. If asked to add or remove anything, say "I can only
      describe what's already on your diagram — switch to the Modify
      tab to make edits."
+
+  5. SYSTEM ARCHETYPES. You know the classic system-dynamics archetypes
+     from Senge's "The Fifth Discipline" and Stroh's "Systems Thinking
+     for Social Change" (catalogued for you below under "System
+     archetypes"). Use them as follows:
+       a. If the user asks what archetypes you know / can describe, list
+          them by name with a one-line description each (you may use a
+          short bulleted list for THIS request only).
+       b. If the user asks you to describe their diagram, or asks which
+          archetype it resembles, compare the visible loops and signed
+          edges to the archetypes. If there's a clear resemblance, name
+          the single best-matching archetype, explain in 2-3 sentences why
+          (which reinforcing/balancing loops map to the archetype's
+          structure), and note the dynamic it predicts. If nothing matches
+          well, say so plainly rather than forcing a fit.
+       c. Only claim a match grounded in loops/edges that are actually in
+          the visible diagram. Never invent structure to fit an archetype.
+
+  6. Keep archetype talk qualitative and intuitive — describe the behaviour
+     over time (e.g. "growth that stalls", "a fix that backfires"), not
+     equations.
 """
+
+
+# ── System-archetype catalogue ─────────────────────────────────────────
+# Concise, behaviour-first summaries of the classic archetypes (Senge, "The
+# Fifth Discipline"; Stroh, "Systems Thinking for Social Change"). Injected
+# into the system prompt so the assistant can (a) list them on request and
+# (b) check whether the user's visible diagram resembles one. Each entry pairs
+# the loop signature (which reinforcing/balancing loops are involved) with the
+# story it tells over time.
+SYSTEM_ARCHETYPES = """\
+System archetypes (qualitative reference):
+
+  • Limits to Growth (a.k.a. Limits to Success): a reinforcing growth loop
+    eventually runs into a balancing loop as some constraint kicks in, so
+    growth slows or stalls. Story: early success that plateaus.
+
+  • Shifting the Burden: a quick symptomatic fix (balancing loop) relieves the
+    symptom but weakens the fundamental solution (a side-effect that erodes
+    capacity), creating dependence on the fix. Story: addiction to the easy
+    fix while the real problem festers.
+
+  • Fixes that Fail (Fixes that Backfire): a fix works in the short term
+    (balancing loop) but triggers unintended consequences (a reinforcing loop)
+    that make the original problem worse later. Story: relief now, bigger
+    problem afterward.
+
+  • Eroding Goals (Drifting Goals): a balancing loop where, under pressure, the
+    goal/standard is lowered instead of improving performance. Story: gradual
+    decline as targets are quietly relaxed.
+
+  • Escalation: two parties each react to the other, two reinforcing loops
+    locked together — an arms race. Story: tit-for-tat that spirals.
+
+  • Success to the Successful: two activities compete for a limited resource;
+    the one that gets ahead is given more, reinforcing its lead while starving
+    the other. Story: rich-get-richer.
+
+  • Tragedy of the Commons: many actors each individually increase use of a
+    shared limited resource (reinforcing per actor) until the commons is
+    depleted and everyone's gains collapse. Story: shared resource exhausted.
+
+  • Growth and Underinvestment: growth presses against a limit that could be
+    relieved by investing in capacity, but eroding performance standards
+    justify underinvestment, so the limit holds and growth stalls. Story:
+    self-inflicted ceiling.
+
+  • Accidental Adversaries: two parties who should cooperate each take locally
+    sensible actions that undermine the other, turning partners into rivals.
+    Story: well-meaning moves that sour a partnership."""
+
+
+def _detect_visible_loops_hint(nodes_visible, edges_visible) -> str:
+    """Deterministically summarise the feedback loops present in the visible
+    subgraph (reinforcing vs balancing, with member variables) so the model
+    has a factual base for archetype matching rather than guessing."""
+    if len(nodes_visible) < 2 or not edges_visible:
+        return "Detected feedback loops in view: none."
+    from .schemas import CanvasState as CS, CanvasNode, CanvasEdge
+    restricted = CS(
+        nodes=[CanvasNode(**n.model_dump()) for n in nodes_visible],
+        edges=[CanvasEdge(**e.model_dump()) for e in edges_visible],
+    )
+    adj, labels = _build_adj(restricted)
+    sccs = _tarjan_scc(adj)
+    lines: List[str] = []
+    r = b = 0
+    for scc in sccs:
+        if len(scc) < 2:
+            continue
+        cl = _classify_loop(adj, scc)
+        if not cl:
+            continue
+        _lid, ltype = cl
+        kind = "reinforcing" if ltype == "R" else "balancing" if ltype == "B" else "mixed"
+        if ltype == "R":
+            r += 1
+        elif ltype == "B":
+            b += 1
+        members = ", ".join(labels.get(n, n) for n in scc[:8])
+        lines.append(f"  - {kind} loop among: {members}")
+    if not lines:
+        return "Detected feedback loops in view: none (the visible edges form no closed cycle)."
+    head = f"Detected feedback loops in view ({r} reinforcing, {b} balancing):"
+    return "\n".join([head, *lines])
 
 
 # Recognise effect questions so we can pre-trace paths before calling
@@ -270,7 +375,14 @@ def _build_system_prompt(canvas: CanvasState, scope: SelectionScope, last_user_m
         )
     else:
         loop_block_lines.append("Visible loops: ALL (no specific loop highlighted)")
-    pieces = [SYSTEM_PROMPT_HEADER, "", scope_block, "", "\n".join(loop_block_lines)]
+    loops_hint = _detect_visible_loops_hint(nodes_visible, edges_visible)
+    pieces = [
+        SYSTEM_PROMPT_HEADER, "",
+        scope_block, "",
+        "\n".join(loop_block_lines), "",
+        loops_hint, "",
+        SYSTEM_ARCHETYPES,
+    ]
     if trace_block:
         pieces.extend(["", trace_block])
     return "\n".join(pieces)

@@ -142,6 +142,15 @@ components:
     model: deepseek-v4-pro
     temperature: 0.2
 
+  # Background recommender that inspects ONLY the current diagram (never the
+  # KG) and proposes one high-confidence feedback loop the user could complete.
+  # Flash model: it runs unprompted in the background, so latency + cost matter.
+  # Slightly higher temperature to let it spot non-obvious but plausible loops;
+  # the deterministic cycle-validation step downstream keeps it honest.
+  loop_recommender:
+    model: deepseek-v4-flash
+    temperature: 0.3
+
 # Graph-RAG runtime settings
 graph_rag:
   neo4j_uri: neo4j+s://f52f4095.databases.neo4j.io

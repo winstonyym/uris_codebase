@@ -33,6 +33,7 @@ from sse_starlette.sse import EventSourceResponse
 from src.causal import CausalReasoner
 from src.chat_agent import ChatAgent
 from src.loop_chat import LoopAssistant
+from src.loop_recommender import LoopRecommender
 from src import r2_uploader
 from src.config import load_config
 from src.embeddings import make_embedder
@@ -48,6 +49,8 @@ from src.schemas import (
     LoopChatRequest,
     LoopDescribeRequest,
     LoopDescribeResponse,
+    LoopRecommendRequest,
+    LoopRecommendResponse,
     SuggestRequest,
     SuggestResponse,
 )
@@ -82,6 +85,7 @@ async def lifespan(app: FastAPI):
     recommender = Recommender(cfg, neo, embedder, router)
     chat = ChatAgent(cfg, router, causal_reasoner=causal)
     loop_chat = LoopAssistant(cfg, router)
+    loop_recommender = LoopRecommender(cfg, router)
 
     # Warm the in-memory KG indices + caches eagerly so the first /suggest
     # call doesn't pay the load cost. Falls back to lazy-load if Neo4j is
@@ -99,6 +103,7 @@ async def lifespan(app: FastAPI):
     app.state.causal = causal
     app.state.chat = chat
     app.state.loop_chat = loop_chat
+    app.state.loop_recommender = loop_recommender
     LOG.info("Graph-RAG service ready.")
     try:
         yield
@@ -324,6 +329,22 @@ def loop_describe(req: LoopDescribeRequest) -> LoopDescribeResponse:
     except Exception as e:
         LOG.warning("/loop-describe falling back to deterministic text: %s", e)
         return LoopDescribeResponse(name=fallback_name, description=fallback_desc, type=req.type)
+
+
+@app.post("/loop-recommend", response_model=LoopRecommendResponse)
+def loop_recommend(req: LoopRecommendRequest) -> LoopRecommendResponse:
+    """Background feedback-loop recommender for the Modify-tab Diagram Assistant.
+
+    Inspects ONLY the current canvas (never the KG) and, when it's highly
+    confident, returns a single composite ``add_loop`` mutation completing a
+    reinforcing/balancing cycle. Returns ``found = False`` otherwise so the UI
+    stays silent. Never raises — a failure is just "no recommendation".
+    """
+    try:
+        return app.state.loop_recommender.recommend(req)
+    except Exception as e:
+        LOG.warning("/loop-recommend failed softly: %s", e)
+        return LoopRecommendResponse(found=False)
 
 
 @app.post("/causal-query", response_model=CausalQueryResponse)

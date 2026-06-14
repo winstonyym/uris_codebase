@@ -137,9 +137,14 @@ class ChatRequest(BaseModel):
 
 class PendingMutation(BaseModel):
     """A staged change proposed by the chat agent. Frontend renders these
-    as a confirm/reject card; on accept it applies the diff to the canvas."""
+    as a confirm/reject card; on accept it applies the diff to the canvas.
+
+    `add_loop` is a COMPOSITE op used by the background loop recommender: its
+    payload carries `nodes` (any new variables needed to close the cycle) and
+    `links` (the signed edges), applied atomically so the user commits a whole
+    feedback loop with one click instead of edge-by-edge."""
     id: str
-    op: Literal["add_node", "remove_node", "add_edge", "remove_edge"]
+    op: Literal["add_node", "remove_node", "add_edge", "remove_edge", "add_loop"]
     payload: Dict[str, Any]
     summary: str                        # human-readable one-liner
 
@@ -174,6 +179,28 @@ class LoopChatRequest(BaseModel):
     messages: List[ChatMessage]
     canvas: CanvasState
     scope: SelectionScope
+
+
+# ── /loop-recommend ────────────────────────────────────────────────────
+
+class LoopRecommendRequest(BaseModel):
+    """Ask the background recommender whether a high-value feedback loop can
+    be completed from the current diagram. Looks ONLY at the canvas — never
+    the knowledge graph."""
+    canvas: CanvasState
+    # Loop signatures the user has already seen / accepted / rejected, so we
+    # never re-propose the same loop. Signatures are label-based (see
+    # loop_recommender._loop_signature) and therefore stable across calls.
+    exclude_signatures: List[str] = Field(default_factory=list)
+
+
+class LoopRecommendResponse(BaseModel):
+    found: bool = False
+    loop_type: Optional[Literal["R", "B"]] = None
+    headline: str = ""                  # short title for the proposal card
+    rationale: str = ""                 # why this loop matters (1-3 sentences)
+    signature: Optional[str] = None     # stable id for client-side dedupe
+    mutation: Optional[PendingMutation] = None   # the composite add_loop
 
 
 # ── /loop-describe ─────────────────────────────────────────────────────
