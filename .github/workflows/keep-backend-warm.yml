@@ -1,0 +1,38 @@
+name: keep-backend-warm
+
+# Keeps the Graph-RAG backend (Vercel serverless) from going fully cold.
+#
+# Vercel Cron on the Hobby plan only runs once per day, which is useless for
+# keep-warm, so we use GitHub Actions instead: it pings the backend's /warm
+# endpoint every few minutes. Each ping rebuilds nothing if the instance is
+# already warm (warm is idempotent), but it keeps a hot instance alive and
+# triggers an early rebuild when Vercel has recycled it.
+#
+# Notes / caveats:
+#   • GitHub's scheduled minimum is every 5 minutes, and schedules can be
+#     delayed several minutes under load — this reduces cold starts, it does
+#     not guarantee zero.
+#   • GitHub disables scheduled workflows after ~60 days of repo inactivity;
+#     push or re-enable to keep it running.
+#   • If you move the backend, update BACKEND_URL below (or set it as a repo
+#     variable: Settings → Secrets and variables → Actions → Variables).
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # every 5 minutes (GitHub minimum)
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /warm
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL || 'https://backend-omega-five-26.vercel.app' }}
+        run: |
+          echo "Warming ${BACKEND_URL}/warm"
+          # -m 55 keeps us under the Hobby 60s function limit; failures are
+          # non-fatal so a single cold/slow boot doesn't fail the workflow.
+          curl -fsS -m 55 -X POST "${BACKEND_URL}/warm" \
+            -o /dev/null -w "warm HTTP %{http_code} in %{time_total}s\n" || \
+            echo "warm ping failed (instance was likely cold — it is booting now)"
