@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -87,13 +88,24 @@ async def lifespan(app: FastAPI):
     loop_chat = LoopAssistant(cfg, router)
     loop_recommender = LoopRecommender(cfg, router)
 
-    # Warm the in-memory KG indices + caches eagerly so the first /suggest
-    # call doesn't pay the load cost. Falls back to lazy-load if Neo4j is
-    # unreachable at startup — the recommender's _ensure_indices retries.
-    try:
-        recommender.warm()
-    except Exception as e:
-        LOG.warning("Recommender warm-up failed (%s); will retry lazily", e)
+    # Warm the in-memory KG indices + caches, but DO NOT block the lifespan on
+    # it. The warm runs a full Neo4j query to load every KG embedding, which can
+    # take many seconds (cold Aura connection + transfer). If we awaited it here
+    # the ASGI app wouldn't accept ANY request — even /health — until it
+    # finished, which is exactly the "backend feels dead on first load" symptom.
+    #
+    # Instead we kick it off on a daemon thread so the app reports ready
+    # immediately. `_ensure_indices()` is idempotent and lock-guarded, so the
+    # first real /suggest (or an explicit /warm ping) safely waits on / re-runs
+    # it if the background thread hasn't finished yet.
+    def _bg_warm():
+        try:
+            recommender.warm()
+            LOG.info("Background warm-up complete.")
+        except Exception as e:
+            LOG.warning("Recommender warm-up failed (%s); will retry lazily", e)
+
+    threading.Thread(target=_bg_warm, name="kg-warm", daemon=True).start()
 
     app.state.cfg = cfg
     app.state.neo = neo
@@ -139,6 +151,48 @@ def health() -> Dict[str, Any]:
         "components": {k: v.model for k, v in cfg.components.items()},
         "r2": r2_uploader.status(),
     }
+
+
+@app.api_route("/warm", methods=["GET", "POST"])
+def warm() -> Dict[str, Any]:
+    """Explicit wake-up call for cold serverless instances.
+
+    Synchronously does the expensive one-time work so the user's FIRST real
+    request is fast: (1) builds the KG indices (idempotent — no-op if the
+    background warm already finished), and (2) instantiates every LLM client so
+    the first chat/suggest/recommend call doesn't pay client construction.
+
+    Designed to be pinged from the Welcome page on mount AND by an external
+    keep-warm pinger. Never raises — partial warmth is reported, not thrown, so
+    a flaky Neo4j/LLM never turns a warm-up into a 500.
+    """
+    t0 = time.perf_counter()
+    result: Dict[str, Any] = {"ok": True, "steps": {}}
+
+    # 1) KG indices (the slow part: a full Neo4j embedding query).
+    s = time.perf_counter()
+    try:
+        app.state.recommender.warm()
+        result["steps"]["indices"] = {"ok": True, "ms": int((time.perf_counter() - s) * 1000)}
+    except Exception as e:
+        result["ok"] = False
+        result["steps"]["indices"] = {"ok": False, "error": str(e), "ms": int((time.perf_counter() - s) * 1000)}
+
+    # 2) Pre-create LLM clients so the first completion skips client init.
+    #    This builds the client objects (cheap); it does not spend tokens.
+    clients: Dict[str, bool] = {}
+    for comp in ("chat_agent", "loop_recommender", "causal_narrator",
+                 "loop_describer", "recommender_reranker"):
+        try:
+            app.state.router.get(comp)
+            clients[comp] = True
+        except Exception as e:
+            clients[comp] = False
+            LOG.debug("warm: could not pre-create %s client: %s", comp, e)
+    result["steps"]["llm_clients"] = clients
+
+    result["total_ms"] = int((time.perf_counter() - t0) * 1000)
+    return result
 
 
 @app.get("/stats")
