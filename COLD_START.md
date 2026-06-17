@@ -22,6 +22,55 @@ service responsive — especially on the **Hobby** plan.
    Welcome-page *mount* (and again on Start), so the cold start overlaps with
    the time the user spends reading the page. (`frontend/src/components/LandingPage.jsx`)
 
+## The big lever: R2-cached index artifact
+
+The dominant cold-start cost is `_build_indices()` streaming the whole KG from
+Neo4j Aura — ~44k node rows (each with a 512-dim embedding) plus ~49k edges —
+and building a ~90 MB numpy matrix. The textual metadata is also in the bundled
+`merged_kg.json`, but the **embeddings live only in Neo4j**.
+
+So the recommender now caches the fully-built index as a single compressed
+artifact in **R2** (`src/recommender.py`):
+
+- On warm, `_try_load_index_from_r2()` does one ~55 MB object GET (float16
+  matrix + JSON metadata) and rehydrates the index in a second or two — no Aura
+  scan. R2 egress is free.
+- On a miss (empty/stale cache, or `KG_INDEX_REBUILD` set), it falls back to the
+  Neo4j build and `_save_index_to_r2()` uploads a fresh artifact for next time.
+- The artifact key embeds a version + the embedding dimensionality:
+  `kg-index/<KG_INDEX_VERSION>/index_d<dim>.npz`.
+
+### Seed the cache once (important on Hobby)
+
+The *first* serverless cold start with an empty cache would still do the slow
+Neo4j build itself — which can exceed Hobby's 60 s limit and get killed before
+it uploads, leaving every cold start rebuilding. Avoid that by seeding from your
+machine (no time limit):
+
+```bash
+cd backend
+python scripts/build_index_cache.py     # builds from Neo4j, uploads to R2
+```
+
+### Invalidate after a re-ingest
+
+When you re-ingest the KG, the embeddings change. Bump the version so a stale
+artifact is never served, in **both** places, then re-seed:
+
+1. Set `KG_INDEX_VERSION=v2` in the Vercel project env (and your local env).
+2. `python scripts/build_index_cache.py`
+
+(Or set `KG_INDEX_REBUILD=1` in Vercel to force a one-time rebuild without
+changing the version.)
+
+### Required env (runtime)
+
+R2 must be reachable from the deployed function, so set these in the **Vercel
+project env** (your local `.env` does not deploy): `R2_ACCOUNT_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME` (plus `REDIS_URL`
+and the model API keys). Without R2 env the service still works — it just falls
+back to the slow Neo4j build each cold start.
+
 ## What you should enable on Vercel (Hobby)
 
 1. **Raise the function timeout.** A cold warm can exceed Hobby's default

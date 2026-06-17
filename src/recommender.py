@@ -35,12 +35,16 @@ The big architectural shift vs. the first version:
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -234,6 +238,100 @@ class Recommender:
             )
 
     def _build_indices(self) -> None:
+        """Populate the in-memory indices.
+
+        Cold-start fast path: try to load a prebuilt index artifact from R2
+        (one ~55 MB object GET, free egress) instead of streaming the whole KG
+        from Neo4j Aura. On a miss (or if R2 is disabled / stale), fall back to
+        the Neo4j build and upload a fresh artifact for the next cold start.
+        Both cache steps are best-effort and never block a successful build.
+        """
+        if self._try_load_index_from_r2():
+            return
+        self._build_indices_from_neo4j()
+        self._save_index_to_r2()
+
+    # ── R2 artifact cache ──────────────────────────────────────────────
+    def _index_artifact_key(self) -> str:
+        # Version is bumped (or KG_INDEX_REBUILD set) when the KG is re-ingested
+        # so a stale artifact is never served. Dimensionality is in the key so a
+        # model/dim change can't load a mismatched matrix.
+        ver = (os.environ.get("KG_INDEX_VERSION") or "v1").strip()
+        return f"kg-index/{ver}/index_d{self.embedder.dimensions}.npz"
+
+    def _try_load_index_from_r2(self) -> bool:
+        if os.environ.get("KG_INDEX_REBUILD"):
+            return False
+        try:
+            from . import r2_uploader
+            if not r2_uploader.is_enabled():
+                return False
+            key = self._index_artifact_key()
+            data = r2_uploader.read_object(key)
+            if not data:
+                return False
+            t0 = time.perf_counter()
+            npz = np.load(io.BytesIO(data), allow_pickle=False)
+            meta = json.loads(npz["meta"].tobytes().decode("utf-8"))
+            if int(meta.get("dim", -1)) != int(self.embedder.dimensions):
+                LOG.warning("R2 index dim mismatch (%s vs %s); rebuilding",
+                            meta.get("dim"), self.embedder.dimensions)
+                return False
+            self._matrix          = npz["matrix"].astype(np.float32)
+            self._ids             = list(meta["ids"])
+            self._id_to_idx       = {kid: i for i, kid in enumerate(self._ids)}
+            self._labels          = meta["labels"]
+            self._categories      = meta["categories"]
+            self._aliases_norm    = meta["aliases_norm"]
+            self._alias_index     = meta["alias_index"]
+            self._neighbours      = meta["neighbours"]
+            self._precomputed_top = meta["precomputed_top"]
+            self._node_provenance = meta["node_provenance"]
+            LOG.info("Loaded KG index from R2 (%s): %d nodes, %.0f ms",
+                     key, len(self._ids), (time.perf_counter() - t0) * 1000)
+            return True
+        except Exception as e:
+            LOG.warning("R2 index load failed (%s); building from Neo4j", e)
+            return False
+
+    def _save_index_to_r2(self) -> None:
+        try:
+            from . import r2_uploader
+            if not r2_uploader.is_enabled() or not self._ids:
+                return
+            t0 = time.perf_counter()
+            meta = {
+                "dim":             int(self.embedder.dimensions),
+                "ids":             self._ids,
+                "labels":          self._labels,
+                "categories":      self._categories,
+                "aliases_norm":    self._aliases_norm,
+                "alias_index":     self._alias_index,
+                "neighbours":      self._neighbours,
+                "precomputed_top": self._precomputed_top,
+                "node_provenance": self._node_provenance,
+            }
+            meta_bytes = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+            tmp = Path(tempfile.gettempdir()) / "kg_index.npz"
+            with open(tmp, "wb") as f:
+                # float16 halves the matrix size; vectors are unit-normalised so
+                # the precision loss is immaterial for cosine ranking.
+                np.savez_compressed(
+                    f,
+                    matrix=self._matrix.astype(np.float16),
+                    meta=np.frombuffer(meta_bytes, dtype=np.uint8),
+                )
+            ok = r2_uploader.upload_file(tmp, self._index_artifact_key())
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            LOG.info("Uploaded KG index to R2 (%s, ok=%s, %.0f ms)",
+                     self._index_artifact_key(), ok, (time.perf_counter() - t0) * 1000)
+        except Exception as e:
+            LOG.warning("R2 index upload failed (%s); continuing without cache", e)
+
+    def _build_indices_from_neo4j(self) -> None:
         q_nodes = """
         MATCH (n:KGNode)
         RETURN n.id          AS id,
