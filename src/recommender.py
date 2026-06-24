@@ -711,11 +711,23 @@ class Recommender:
         filtered/shaped by the user's *current* canvas state."""
         canvas_by_label = {_normalize_label(n.label): n for n in req.canvas.nodes}
 
-        # Drop anything already on the canvas (by normalised label)
-        novel = [
-            c for c in candidates
-            if c.id != anchor_id and _normalize_label(c.label) not in canvas_by_label
-        ][: max(req.max_suggestions * 2, 6)]
+        # Drop anything already on the canvas (by normalised label) AND
+        # de-duplicate candidates that share a normalised label. The KG can
+        # hold several distinct ids for the same variable (e.g. two "Walk to
+        # work" nodes); without this the panel showed the same label twice.
+        # Candidates are pre-sorted by score, so the first occurrence is the
+        # strongest — keep it, discard later twins.
+        novel: List[_Candidate] = []
+        seen_labels: set = set()
+        for c in candidates:
+            if c.id == anchor_id:
+                continue
+            nl = _normalize_label(c.label)
+            if nl in canvas_by_label or nl in seen_labels:
+                continue
+            seen_labels.add(nl)
+            novel.append(c)
+        novel = novel[: max(req.max_suggestions * 2, 6)]
 
         # Build new-node suggestions, with per-candidate canvas edge proposals
         # batched into ONE Cypher call (replaces the previous N+1 pattern).
@@ -724,6 +736,7 @@ class Recommender:
             req.canvas,
         )
 
+        focus_id = req.query_node.id
         new_nodes_out: List[SuggestedNode] = []
         if req.include_new_nodes:
             for c in novel[: req.max_suggestions]:
@@ -734,6 +747,29 @@ class Recommender:
                 provenance = _coerce_provenance(self._node_provenance.get(c.id))
                 if not provenance and c.rel_chain:
                     provenance = _coerce_provenance(c.rel_chain[0].get("prov"))
+
+                edges = list(edges_by_cand.get(c.id, []))
+                # Ensure the candidate connects to the FOCUS (query) node using
+                # the KG anchor relationship, preserving its real DIRECTION
+                # (into or out of the focus) and SIGN (+/−). Otherwise — when
+                # the focus's canvas label didn't string-match the KG anchor
+                # label — no focus edge is returned and the frontend has to
+                # fabricate an outgoing "+" edge, which is what made every
+                # recommendation look like a positive out-arrow.
+                if c.rel_chain and not any(e.canvas_node_id == focus_id for e in edges):
+                    rc = c.rel_chain[0]
+                    # rel_chain direction is relative to the ANCHOR:
+                    #   "outgoing" = anchor → candidate  ⇒ focus → new ⇒ "incoming"
+                    #   "incoming" = candidate → anchor  ⇒ new → focus ⇒ "outgoing"
+                    from_new_dir = "incoming" if rc.get("direction") == "outgoing" else "outgoing"
+                    edges.insert(0, SuggestedEdgeFromNew(
+                        canvas_node_id=focus_id,
+                        direction=from_new_dir,
+                        polarity=_coerce_sign(rc.get("sign")),
+                        weight=int(rc.get("weight") or 1),
+                        provenance=_coerce_provenance(rc.get("prov")),
+                    ))
+
                 new_nodes_out.append(SuggestedNode(
                     kg_id=c.id,
                     label=c.label,
@@ -741,7 +777,7 @@ class Recommender:
                     alpha=round(c.alpha, 3),
                     rationale=c.rationale,
                     provenance=provenance,
-                    suggested_edges=edges_by_cand.get(c.id, []),
+                    suggested_edges=edges,
                 ))
 
         # New edges between canvas-nodes — one Cypher for the lot
