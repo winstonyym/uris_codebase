@@ -195,6 +195,26 @@ def warm() -> Dict[str, Any]:
     return result
 
 
+@app.api_route("/db-ping", methods=["GET", "POST"])
+def db_ping() -> Dict[str, Any]:
+    """Lightweight Neo4j keep-alive.
+
+    Runs a trivial ``RETURN 1`` over the existing Bolt connection so an idle
+    Aura Free instance doesn't auto-pause. It deliberately does NOT load the KG
+    indices (that path reads from the R2 cache and never touches Neo4j), and it
+    is intentionally NOT written to the activity log. Called once a day by the
+    keep-backend-warm GitHub Actions workflow. Never raises.
+    """
+    t0 = time.perf_counter()
+    try:
+        with app.state.neo.session() as s:
+            value = s.run("RETURN 1 AS ok").single()["ok"]
+        return {"ok": True, "value": value, "ms": int((time.perf_counter() - t0) * 1000)}
+    except Exception as e:
+        LOG.warning("/db-ping failed: %s", e)
+        return {"ok": False, "error": str(e), "ms": int((time.perf_counter() - t0) * 1000)}
+
+
 @app.get("/stats")
 def stats() -> Dict[str, Any]:
     """Visibility into cache hit-rates and pre-loaded index sizes."""

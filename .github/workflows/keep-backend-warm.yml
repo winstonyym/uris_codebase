@@ -1,29 +1,34 @@
-name: keep-backend-warm
+name: keep-warm
 
-# Keeps the Graph-RAG backend (Vercel serverless) from going fully cold.
+# Two scheduled heartbeats for the Graph-RAG backend (Vercel serverless):
 #
-# Vercel Cron on the Hobby plan only runs once per day, which is useless for
-# keep-warm, so we use GitHub Actions instead: it pings the backend's /warm
-# endpoint every few minutes. Each ping rebuilds nothing if the instance is
-# already warm (warm is idempotent), but it keeps a hot instance alive and
-# triggers an early rebuild when Vercel has recycled it.
+#   1. warm-backend     — every 5 min, pings /warm so the function doesn't go
+#      fully cold (Vercel Cron on Hobby only runs daily, so we use Actions).
+#   2. keepalive-neo4j  — once a day, pings /db-ping which runs `RETURN 1`
+#      against Neo4j Aura. Needed because /warm now loads its index from the R2
+#      cache and no longer touches Neo4j, so nothing else keeps Aura Free awake.
+#      /db-ping uses the backend's own Bolt connection, so no Neo4j credentials
+#      live in GitHub, and the query is not written to the activity log.
 #
 # Notes / caveats:
-#   • GitHub's scheduled minimum is every 5 minutes, and schedules can be
-#     delayed several minutes under load — this reduces cold starts, it does
-#     not guarantee zero.
+#   • GitHub's scheduled minimum is every 5 minutes and can be delayed under
+#     load — this reduces cold starts, it doesn't guarantee zero.
 #   • GitHub disables scheduled workflows after ~60 days of repo inactivity;
 #     push or re-enable to keep it running.
-#   • If you move the backend, update BACKEND_URL below (or set it as a repo
-#     variable: Settings → Secrets and variables → Actions → Variables).
+#   • If you move the backend, update BACKEND_URL (or set it as a repo variable:
+#     Settings → Secrets and variables → Actions → Variables).
 
 on:
   schedule:
-    - cron: "*/5 * * * *"     # every 5 minutes (GitHub minimum)
-  workflow_dispatch: {}        # allow manual runs from the Actions tab
+    - cron: "*/5 * * * *"     # warm-backend: every 5 minutes (GitHub minimum)
+    - cron: "0 6 * * *"       # keepalive-neo4j: daily at 06:00 UTC
+  workflow_dispatch: {}        # manual runs trigger BOTH jobs (handy for testing)
 
 jobs:
-  ping:
+  warm-backend:
+    # Runs on the 5-min schedule and on manual dispatch; skipped on the
+    # daily-only cron so we don't double-warm.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '*/5 * * * *' }}
     runs-on: ubuntu-latest
     steps:
       - name: Ping /warm
@@ -36,3 +41,17 @@ jobs:
           curl -fsS -m 55 -X POST "${BACKEND_URL}/warm" \
             -o /dev/null -w "warm HTTP %{http_code} in %{time_total}s\n" || \
             echo "warm ping failed (instance was likely cold — it is booting now)"
+
+  keepalive-neo4j:
+    # Runs on the daily cron and on manual dispatch.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * *' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /db-ping (Neo4j RETURN 1)
+        env:
+          BACKEND_URL: ${{ vars.BACKEND_URL || 'https://backend-omega-five-26.vercel.app' }}
+        run: |
+          echo "Keeping Neo4j awake via ${BACKEND_URL}/db-ping"
+          curl -fsS -m 55 "${BACKEND_URL}/db-ping" \
+            -w "\ndb-ping HTTP %{http_code} in %{time_total}s\n" || \
+            echo "db-ping failed (instance cold or Aura resuming — retry tomorrow)"

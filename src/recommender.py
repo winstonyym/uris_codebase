@@ -89,6 +89,55 @@ def _normalize_label(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
+def _sentence_case(s: str) -> str:
+    """Format a label in sentence case: capitalise the first letter and
+    lower-case the rest, while preserving all-caps tokens (acronyms like GDP,
+    CO2, AI) so we don't turn them into 'Gdp'."""
+    s = (s or "").strip()
+    if not s:
+        return s
+    # A fully upper-case phrase ("WALK TO WORK") is shouting, not acronyms —
+    # sentence-case it normally.
+    if s.isupper():
+        return s[:1].upper() + s[1:].lower()
+    words = s.split(" ")
+    out = []
+    for i, w in enumerate(words):
+        if not w:
+            continue
+        if w.isupper() and len(w) > 1:          # keep acronyms intact
+            out.append(w)
+        elif i == 0:
+            out.append(w[:1].upper() + w[1:].lower())
+        else:
+            out.append(w.lower())
+    return " ".join(out)
+
+
+def _labels_too_similar(a: str, b: str) -> bool:
+    """True when two ALREADY-normalised labels are near-duplicates — i.e. the
+    same term spelled differently or a sub-phrase of the other. Used to keep the
+    top suggestions diverse (no 'Walk to work' / 'Walking to work' pairs)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Sub-phrase containment ("rent" vs "rent burden", "walk work" vs "walk to
+    # work") — compare with spaces removed so word-spacing differences don't hide it.
+    ca, cb = a.replace(" ", ""), b.replace(" ", "")
+    if ca and cb and (ca in cb or cb in ca):
+        return True
+    # Token overlap (Jaccard) catches reordered / partially-shared phrases.
+    ta, tb = set(a.split()), set(b.split())
+    if ta and tb:
+        jac = len(ta & tb) / len(ta | tb)
+        if jac >= 0.6:
+            return True
+    # Character-level similarity catches spelling variants ("colour"/"color").
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a, b).ratio() >= 0.85
+
+
 def _coerce_sign(raw: Any) -> str:
     """Map a KG edge sign onto the canvas polarity literal ('+' or '-').
 
@@ -711,21 +760,26 @@ class Recommender:
         filtered/shaped by the user's *current* canvas state."""
         canvas_by_label = {_normalize_label(n.label): n for n in req.canvas.nodes}
 
-        # Drop anything already on the canvas (by normalised label) AND
-        # de-duplicate candidates that share a normalised label. The KG can
-        # hold several distinct ids for the same variable (e.g. two "Walk to
-        # work" nodes); without this the panel showed the same label twice.
-        # Candidates are pre-sorted by score, so the first occurrence is the
-        # strongest — keep it, discard later twins.
+        # Highest-α first. The LLM rerank overwrites `alpha` WITHOUT re-sorting,
+        # so the incoming order can be stale; sort here so the top-N we surface
+        # (and the 3 the canvas shows) are genuinely the most confident.
+        ranked = sorted(candidates, key=lambda c: c.alpha, reverse=True)
+
+        # Build the shortlist: drop anything already on the canvas, and skip
+        # near-duplicates of an already-kept suggestion (exact twins like two
+        # "Walk to work" KG ids, but also spelling variants / sub-phrases) so
+        # the three options stay genuinely distinct.
         novel: List[_Candidate] = []
-        seen_labels: set = set()
-        for c in candidates:
+        kept_norms: List[str] = []
+        for c in ranked:
             if c.id == anchor_id:
                 continue
             nl = _normalize_label(c.label)
-            if nl in canvas_by_label or nl in seen_labels:
+            if nl in canvas_by_label:
                 continue
-            seen_labels.add(nl)
+            if any(_labels_too_similar(nl, k) for k in kept_norms):
+                continue
+            kept_norms.append(nl)
             novel.append(c)
         novel = novel[: max(req.max_suggestions * 2, 6)]
 
@@ -772,7 +826,7 @@ class Recommender:
 
                 new_nodes_out.append(SuggestedNode(
                     kg_id=c.id,
-                    label=c.label,
+                    label=_sentence_case(c.label),
                     category=c.category,
                     alpha=round(c.alpha, 3),
                     rationale=c.rationale,
