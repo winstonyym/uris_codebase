@@ -18,3 +18,8 @@ certifi>=2024.2.2
 # (Cloudflare R2 is S3-compatible). The import is guarded; missing
 # package or missing env both degrade to local-file-only logging.
 boto3>=1.34
+
+# Clerk session-token verification (src/auth.py). Every LLM endpoint is
+# gated on a verified token so this service can't be used as an open proxy
+# to the operator's API keys.
+clerk-backend-api>=3.0

@@ -30,6 +30,7 @@ import os
 import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from . import usage
 from .config import Config
 from .llm_router import LLMRouter
 from .schemas import (
@@ -435,14 +436,30 @@ class LoopAssistant:
                 continue
             msgs.append({"role": m.role, "content": m.content})
 
-        stream = client.chat.completions.create(
-            model=spec.model,
-            messages=msgs,
-            temperature=spec.temperature,
-            stream=True,
-        )
+        create_kwargs: Dict[str, Any] = {
+            "model": spec.model,
+            "messages": msgs,
+            "temperature": spec.temperature,
+            "stream": True,
+            # Trailing usage chunk → the free-tier ledger charges real tokens.
+            "stream_options": {"include_usage": True},
+        }
+        try:
+            stream = client.chat.completions.create(**create_kwargs)
+        except Exception as e:
+            if "stream_options" not in str(e).lower():
+                raise
+            LOG.info("loop-chat: provider rejected stream_options; usage will be estimated")
+            create_kwargs.pop("stream_options", None)
+            stream = client.chat.completions.create(**create_kwargs)
+
         buf: List[str] = []
+        saw_usage = False
         for chunk in stream:
+            # The usage chunk has no choices — read it before the guard below.
+            if getattr(chunk, "usage", None):
+                usage.record_openai(chunk)
+                saw_usage = True
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -450,6 +467,8 @@ class LoopAssistant:
             if txt:
                 buf.append(txt)
                 yield ("delta", txt)
+        if not saw_usage:
+            usage.record_estimate(json.dumps(msgs), "".join(buf))
         yield ("done", "".join(buf).strip() or "(no response)")
 
     # ── Anthropic ─────────────────────────────────────────────────────
@@ -470,6 +489,7 @@ class LoopAssistant:
             system=system,
             messages=msg_history,
         )
+        usage.record_anthropic(resp)
         out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         if out:
             yield ("delta", out)

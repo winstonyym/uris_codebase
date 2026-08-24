@@ -37,6 +37,7 @@ import os
 import uuid
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from . import usage
 from .config import Config
 from .llm_router import LLMRouter
 from .schemas import CanvasState, ChatMessage, ChatResponse, PendingMutation
@@ -293,19 +294,37 @@ class ChatAgent:
         reply_parts: List[str] = []
 
         for _step in range(MAX_STEPS):
-            stream = client.chat.completions.create(
-                model=spec.model,
-                messages=msgs,
-                tools=tools,
-                temperature=spec.temperature,
-                stream=True,
-            )
+            create_kwargs: Dict[str, Any] = {
+                "model": spec.model,
+                "messages": msgs,
+                "tools": tools,
+                "temperature": spec.temperature,
+                "stream": True,
+                # Ask for a trailing usage chunk so the free-tier ledger can
+                # charge real token counts instead of guessing from length.
+                "stream_options": {"include_usage": True},
+            }
+            try:
+                stream = client.chat.completions.create(**create_kwargs)
+            except Exception as e:
+                if "stream_options" not in str(e).lower():
+                    raise
+                LOG.info("chat: provider rejected stream_options; usage will be estimated")
+                create_kwargs.pop("stream_options", None)
+                stream = client.chat.completions.create(**create_kwargs)
+
             text_buf: List[str] = []
             # tool calls arrive fragmented across chunks, keyed by index
             tool_acc: Dict[int, Dict[str, str]] = {}
             finish_reason: Optional[str] = None
+            saw_usage = False
 
             for chunk in stream:
+                # The usage chunk carries no choices, so read it before the
+                # empty-choices guard below skips the chunk entirely.
+                if getattr(chunk, "usage", None):
+                    usage.record_openai(chunk)
+                    saw_usage = True
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
@@ -326,6 +345,11 @@ class ChatAgent:
                             acc["name"] = tc.function.name
                         if tc.function.arguments:
                             acc["args"] += tc.function.arguments
+
+            if not saw_usage:
+                # Provider streamed without usage data — charge an estimate
+                # rather than letting the turn go free.
+                usage.record_estimate(json.dumps(msgs), "".join(text_buf))
 
             if not tool_acc:
                 # No tool calls this turn → conversation is finished.
@@ -400,6 +424,7 @@ class ChatAgent:
                 tools=tools,
                 messages=msg_history,
             )
+            usage.record_anthropic(resp)
             tool_results_for_next: List[Dict[str, Any]] = []
             assistant_blocks: List[Dict[str, Any]] = []
 

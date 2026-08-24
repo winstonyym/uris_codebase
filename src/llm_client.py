@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass
 from typing import Protocol
 
+from . import usage
+
 
 @dataclass
 class ModelSpec:
@@ -100,6 +102,8 @@ class OpenAICompatibleClient:
                 resp = self.client.chat.completions.create(**kwargs)
             else:
                 raise
+        # Charge the caller's free-tier budget. No-op outside a request.
+        usage.record_openai(resp)
         return resp.choices[0].message.content or ""
  
 class AnthropicClient:
@@ -117,6 +121,7 @@ class AnthropicClient:
             max_tokens=self.spec.max_tokens,    # ADD THIS LINE
             temperature=self.spec.temperature,
         )
+        usage.record_anthropic(resp)
         return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
 
 

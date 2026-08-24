@@ -27,10 +27,14 @@ from typing import Any, Dict
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from src import usage
+from src.auth import ClerkUser, allowed_origins, conversation_id, require_user
+from src.usage import QuotaExceeded, get_ledger
 from src.causal import CausalReasoner
 from src.chat_agent import ChatAgent
 from src.loop_chat import LoopAssistant
@@ -127,11 +131,68 @@ app = FastAPI(title="Graph-RAG", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # dev — tighten in prod
+    # Set ALLOWED_ORIGINS on the deployment to narrow this to your own
+    # frontends; falls back to "*" so an unconfigured deploy still works.
+    allow_origins=allowed_origins(),
     allow_credentials=False,
     allow_methods=["*"],
+    # Authorization carries the Clerk session token, X-Session-Id names the
+    # conversation the free-tier budget is charged against.
     allow_headers=["*"],
+    expose_headers=["X-Usage-Used", "X-Usage-Limit", "X-Usage-Remaining"],
 )
+
+
+# ── Auth + free-tier quota ────────────────────────────────────────────
+#
+# Every endpoint below that can reach an LLM depends on `billed_caller`,
+# which (a) verifies the Clerk session token and (b) checks the caller
+# hasn't already spent this conversation's token budget. Endpoints that
+# cost nothing — health, warm, stats — stay open so the keep-warm cron and
+# the pre-sign-in landing page keep working.
+
+
+class Caller:
+    """A verified user plus the conversation their tokens are charged to."""
+
+    __slots__ = ("user", "conversation")
+
+    def __init__(self, user: ClerkUser, conversation: str):
+        self.user = user
+        self.conversation = conversation
+
+    @property
+    def user_id(self) -> str:
+        return self.user.user_id
+
+
+def billed_caller(request: Request, user: ClerkUser = Depends(require_user)) -> Caller:
+    """Verify the caller and admit them under the free tier, or raise."""
+    conversation = conversation_id(request, user)
+    get_ledger().admit(user.user_id, conversation)
+    return Caller(user, conversation)
+
+
+@app.exception_handler(QuotaExceeded)
+async def _quota_exceeded_handler(request: Request, exc: QuotaExceeded) -> JSONResponse:
+    """Turn a blown budget into a 429 the frontend can render verbatim."""
+    body: Dict[str, Any] = {
+        "error": "quota_exceeded",
+        "reason": exc.reason,
+        "detail": exc.message,
+    }
+    body.update(exc.detail)
+    return JSONResponse(status_code=429, content=body)
+
+
+def _usage_headers(acc: usage.UsageAccumulator) -> Dict[str, str]:
+    """Budget meter for a just-completed request, from the committed total."""
+    m = usage.meter(acc.conversation_total, acc.total)
+    return {
+        "X-Usage-Used": str(m["used_tokens"]),
+        "X-Usage-Limit": str(m["limit_tokens"]),
+        "X-Usage-Remaining": str(m["remaining_tokens"] if m["remaining_tokens"] is not None else -1),
+    }
 
 
 # ── Routes ────────────────────────────────────────────────────────────
@@ -221,6 +282,18 @@ def stats() -> Dict[str, Any]:
     return app.state.recommender.stats()
 
 
+@app.get("/usage")
+def usage_meter(request: Request, user: ClerkUser = Depends(require_user)) -> Dict[str, Any]:
+    """How much of this conversation's free budget is left.
+
+    The frontend polls this after each turn to draw its meter. Requires a
+    valid session token but never 429s — you can always ask how broke you
+    are. `backing` reports whether counters are shared (redis) or
+    per-process (in-process), so a misconfigured deploy is visible here.
+    """
+    return get_ledger().snapshot(user.user_id, conversation_id(request, user))
+
+
 # ── Activity logging ──────────────────────────────────────────────────
 #
 # One JSON document per (user, session). Browser clients post batches;
@@ -266,7 +339,11 @@ def _load_session_doc(path: Path, r2_key: str) -> Dict[str, Any]:
 
 
 @app.post("/log")
-def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
+def log_events(
+    req: LogRequest,
+    background: BackgroundTasks,
+    user: ClerkUser = Depends(require_user),
+) -> Dict[str, Any]:
     """Accumulate a batch of activity events into this session's JSON log.
 
     Two-tier durability:
@@ -305,7 +382,11 @@ def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
         "name":          req.name,
         "variant":       req.variant,
         "secure":        req.secure,
-        "access_key_id": req.access_key_id,   # beta access key (never the raw key)
+        # Identity now comes from the verified Clerk token, not from the
+        # body — a participant can't relabel someone else's session.
+        "clerk_user_id": user.user_id,
+        "clerk_email":   user.email,
+        "access_key_id": req.access_key_id,   # legacy beta key id, if any
         "started_at":    req.started_at,
         "updated_at":    _dt.now(_tz.utc).isoformat(),
         "event_count":   len(events),
@@ -334,16 +415,26 @@ def log_events(req: LogRequest, background: BackgroundTasks) -> Dict[str, Any]:
 
 
 @app.post("/suggest", response_model=SuggestResponse)
-def suggest(req: SuggestRequest) -> SuggestResponse:
+def suggest(
+    req: SuggestRequest,
+    response: Response,
+    caller: Caller = Depends(billed_caller),
+) -> SuggestResponse:
     try:
-        return app.state.recommender.suggest(req)
+        with get_ledger().track(caller.user_id, caller.conversation) as acc:
+            out = app.state.recommender.suggest(req)
     except Exception as e:
         LOG.exception("/suggest failed")
         raise HTTPException(status_code=500, detail=str(e))
+    response.headers.update(_usage_headers(acc))
+    return out
 
 
 @app.post("/loop-describe", response_model=LoopDescribeResponse)
-def loop_describe(req: LoopDescribeRequest) -> LoopDescribeResponse:
+def loop_describe(
+    req: LoopDescribeRequest,
+    caller: Caller = Depends(billed_caller),
+) -> LoopDescribeResponse:
     """Name + describe a single feedback loop the frontend just detected.
 
     The loop's *type* (R / B) is computed deterministically on the client
@@ -395,7 +486,8 @@ def loop_describe(req: LoopDescribeRequest) -> LoopDescribeResponse:
     try:
         from src.llm_client import extract_json
         _spec, client = app.state.router.get("loop_describer")
-        raw = client.complete(system, user)
+        with get_ledger().track(caller.user_id, caller.conversation):
+            raw = client.complete(system, user)
         data = extract_json(raw)
         name = str(data.get("name") or fallback_name).strip()
         description = str(data.get("description") or fallback_desc).strip()
@@ -406,7 +498,10 @@ def loop_describe(req: LoopDescribeRequest) -> LoopDescribeResponse:
 
 
 @app.post("/loop-recommend", response_model=LoopRecommendResponse)
-def loop_recommend(req: LoopRecommendRequest) -> LoopRecommendResponse:
+def loop_recommend(
+    req: LoopRecommendRequest,
+    caller: Caller = Depends(billed_caller),
+) -> LoopRecommendResponse:
     """Background feedback-loop recommender for the Modify-tab Diagram Assistant.
 
     Inspects ONLY the current canvas (never the KG) and, when it's highly
@@ -415,34 +510,53 @@ def loop_recommend(req: LoopRecommendRequest) -> LoopRecommendResponse:
     stays silent. Never raises — a failure is just "no recommendation".
     """
     try:
-        return app.state.loop_recommender.recommend(req)
+        with get_ledger().track(caller.user_id, caller.conversation):
+            return app.state.loop_recommender.recommend(req)
     except Exception as e:
         LOG.warning("/loop-recommend failed softly: %s", e)
         return LoopRecommendResponse(found=False)
 
 
 @app.post("/causal-query", response_model=CausalQueryResponse)
-def causal_query(req: CausalQueryRequest) -> CausalQueryResponse:
+def causal_query(
+    req: CausalQueryRequest,
+    response: Response,
+    caller: Caller = Depends(billed_caller),
+) -> CausalQueryResponse:
     try:
-        return app.state.causal.answer(req)
+        with get_ledger().track(caller.user_id, caller.conversation) as acc:
+            out = app.state.causal.answer(req)
     except Exception as e:
         LOG.exception("/causal-query failed")
         raise HTTPException(status_code=500, detail=str(e))
+    response.headers.update(_usage_headers(acc))
+    return out
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest) -> ChatResponse:
+def chat(
+    req: ChatRequest,
+    response: Response,
+    caller: Caller = Depends(billed_caller),
+) -> ChatResponse:
     """Non-streaming chat. Returns the assistant's text reply plus any
     pending mutations the user can accept/reject from the UI."""
     try:
-        return app.state.chat.respond(req.messages, req.canvas)
+        with get_ledger().track(caller.user_id, caller.conversation) as acc:
+            out = app.state.chat.respond(req.messages, req.canvas)
     except Exception as e:
         LOG.exception("/chat failed")
         raise HTTPException(status_code=500, detail=str(e))
+    response.headers.update(_usage_headers(acc))
+    return out
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, request: Request):
+async def chat_stream(
+    req: ChatRequest,
+    request: Request,
+    caller: Caller = Depends(billed_caller),
+):
     """Token-streaming chat over SSE.
 
     Event sequence:
@@ -460,44 +574,62 @@ async def chat_stream(req: ChatRequest, request: Request):
     """
     import anyio
 
+    ledger = get_ledger()
+
     async def event_gen():
         t0 = time.perf_counter()
         yield {"event": "thinking", "data": "{}"}
 
         send, receive = anyio.create_memory_object_stream(64)
+        # Created out here, bound inside the worker thread: the LLM clients
+        # push their token counts into it from wherever they run.
+        acc = usage.UsageAccumulator()
 
         def produce():
             # Runs on a worker thread — drives the sync generator and
             # pushes each ("kind", payload) onto the stream.
             try:
-                for kind, payload in app.state.chat.respond_stream(
-                    req.messages, req.canvas,
-                ):
-                    if kind == "done":
-                        data = payload.model_dump_json()
-                    elif kind == "mutation":
-                        data = payload.model_dump_json()
-                    else:  # delta
-                        data = json.dumps({"text": payload})
-                    anyio.from_thread.run(send.send, (kind, data))
+                with usage.bind(acc):
+                    for kind, payload in app.state.chat.respond_stream(
+                        req.messages, req.canvas,
+                    ):
+                        if kind == "done":
+                            data = payload.model_dump_json()
+                        elif kind == "mutation":
+                            data = payload.model_dump_json()
+                        else:  # delta
+                            data = json.dumps({"text": payload})
+                        anyio.from_thread.run(send.send, (kind, data))
             except Exception as e:  # pragma: no cover
                 LOG.exception("/chat/stream failed")
                 anyio.from_thread.run(send.send, ("error", str(e)))
             finally:
                 anyio.from_thread.run(send.aclose)
 
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(anyio.to_thread.run_sync, produce)
-            async for kind, data in receive:
-                yield {"event": kind, "data": data}
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(anyio.to_thread.run_sync, produce)
+                async for kind, data in receive:
+                    yield {"event": kind, "data": data}
+        finally:
+            # Charge the budget even if the client hung up mid-stream —
+            # those tokens were still spent. Nothing may be yielded from a
+            # finally block during generator close, so the meter event goes
+            # after it, on the normal path only.
+            acc.conversation_total = ledger.commit(caller.user_id, caller.conversation, acc)
 
+        yield {"event": "usage", "data": json.dumps(usage.meter(acc.conversation_total, acc.total))}
         yield {"event": "done_meta", "data": str(int((time.perf_counter() - t0) * 1000))}
 
     return EventSourceResponse(event_gen())
 
 
 @app.post("/loop-chat/stream")
-async def loop_chat_stream(req: LoopChatRequest, request: Request):
+async def loop_chat_stream(
+    req: LoopChatRequest,
+    request: Request,
+    caller: Caller = Depends(billed_caller),
+):
     """Scope-bound, read-only chat for the Visualise tab.
 
     The generator in `loop_chat.LoopAssistant.respond_stream` yields
@@ -507,37 +639,49 @@ async def loop_chat_stream(req: LoopChatRequest, request: Request):
     """
     import anyio
 
+    ledger = get_ledger()
+
     async def event_gen():
         t0 = time.perf_counter()
         yield {"event": "thinking", "data": "{}"}
         send, receive = anyio.create_memory_object_stream(64)
+        acc = usage.UsageAccumulator()
 
         def produce():
             try:
-                for kind, payload in app.state.loop_chat.respond_stream(req):
-                    if kind == "delta":
-                        data = json.dumps({"text": payload})
-                    else:  # done
-                        data = json.dumps({"reply": payload})
-                    anyio.from_thread.run(send.send, (kind, data))
+                with usage.bind(acc):
+                    for kind, payload in app.state.loop_chat.respond_stream(req):
+                        if kind == "delta":
+                            data = json.dumps({"text": payload})
+                        else:  # done
+                            data = json.dumps({"reply": payload})
+                        anyio.from_thread.run(send.send, (kind, data))
             except Exception as e:
                 LOG.exception("/loop-chat/stream failed")
                 anyio.from_thread.run(send.send, ("error", str(e)))
             finally:
                 anyio.from_thread.run(send.aclose)
 
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(anyio.to_thread.run_sync, produce)
-            async for kind, data in receive:
-                yield {"event": kind, "data": data}
+        try:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(anyio.to_thread.run_sync, produce)
+                async for kind, data in receive:
+                    yield {"event": kind, "data": data}
+        finally:
+            acc.conversation_total = ledger.commit(caller.user_id, caller.conversation, acc)
 
+        yield {"event": "usage", "data": json.dumps(usage.meter(acc.conversation_total, acc.total))}
         yield {"event": "done_meta", "data": str(int((time.perf_counter() - t0) * 1000))}
 
     return EventSourceResponse(event_gen())
 
 
 @app.post("/suggest/stream")
-async def suggest_stream(req: SuggestRequest, request: Request):
+async def suggest_stream(
+    req: SuggestRequest,
+    request: Request,
+    caller: Caller = Depends(billed_caller),
+):
     """Progressive SSE stream of /suggest results.
 
     Event sequence:
@@ -556,21 +700,30 @@ async def suggest_stream(req: SuggestRequest, request: Request):
     """
     import anyio
 
+    ledger = get_ledger()
+
     async def event_gen():
         t0 = time.perf_counter()
         yield {"event": "thinking", "data": "{}"}
+        acc = usage.UsageAccumulator()
+
+        def run_stages():
+            with usage.bind(acc):
+                return list(app.state.recommender.stages(req))
+
         try:
             # Drive the synchronous generator on a thread so the loop is
             # free for the next request / heartbeat.
-            it = await anyio.to_thread.run_sync(
-                lambda: list(app.state.recommender.stages(req))
-            )
+            it = await anyio.to_thread.run_sync(run_stages)
         except Exception as e:
             LOG.exception("/suggest/stream failed")
+            ledger.commit(caller.user_id, caller.conversation, acc)
             yield {"event": "error", "data": str(e)}
             return
+        acc.conversation_total = ledger.commit(caller.user_id, caller.conversation, acc)
         for kind, resp in it:
             yield {"event": kind, "data": resp.model_dump_json()}
+        yield {"event": "usage", "data": json.dumps(usage.meter(acc.conversation_total, acc.total))}
         yield {"event": "done", "data": str(int((time.perf_counter() - t0) * 1000))}
 
     return EventSourceResponse(event_gen())

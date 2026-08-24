@@ -164,7 +164,7 @@ graph_rag:
   # tuning per-deployment are `max_hops` (accuracy↑ / latency↑) and
   # `top_k_vector` (recall↑ / rerank cost↑).
   #
-  top_k_vector: 30   # Vector-search recall pool. The reranker only ever sees
+  top_k_vector: 20   # Vector-search recall pool. The reranker only ever sees
                      # these, so anything outside this set can never be
                      # suggested → size it for recall. 30 reliably contains the
                      # right neighbours for a CLD-sized graph; below ~20 recall
@@ -174,7 +174,7 @@ graph_rag:
                      # so 8 covers it without overwhelming the canvas. (Was 5,
                      # which silently capped richer requests.) Truncation is
                      # cheap; it doesn't change how many candidates get reranked.
-  max_hops: 2        # Graph-neighbour expansion radius around each matched
+  max_hops: 1        # Graph-neighbour expansion radius around each matched
                      # node. 1 = direct neighbours only (fast, but misses
                      # indirect causal links); 2 captures neighbours-of-
                      # neighbours, which materially improves suggestion quality
