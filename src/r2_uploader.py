@@ -1,10 +1,20 @@
-"""Cloudflare R2 (S3-compatible) uploader for activity logs.
+"""Cloudflare R2 (S3-compatible) object access.
 
-Optional add-on to the local JSONL logger. When all required env vars
-are present AND `boto3` is installed, every successful append to a
-session's local log file is followed by a background upload of the
-full JSONL to R2. If anything's missing the module is a no-op and the
-local-only path keeps working — never breaks the request.
+Two consumers:
+
+  * **Activity logs** (the original use). When all required env vars are
+    present AND `boto3` is installed, every successful append to a
+    session's local log file is followed by a background upload of the
+    full JSONL to R2. If anything's missing the module is a no-op and the
+    local-only path keeps working — never breaks the request.
+  * **Diagram storage** (`src/diagrams.py`). R2 is the source of truth for
+    saved diagrams and the public gallery, so that module needs to write
+    bytes it never put on disk, enumerate a prefix and delete a key —
+    hence `put_object` / `put_json` / `list_objects` / `delete_object`
+    below. Those are the only functions here that report failure by
+    raising; the log path's fire-and-forget helpers still swallow
+    everything, because a dropped telemetry batch is not worth a 500 while
+    a dropped diagram is.
 
 Required env vars:
     R2_ACCOUNT_ID         — bucket account; forms the S3 endpoint URL
@@ -25,15 +35,25 @@ Notes:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("graph_rag.r2")
+
+
+class R2Unavailable(RuntimeError):
+    """R2 is not configured (env missing, boto3 absent, or client init failed).
+
+    Raised only by the diagram-storage helpers, which have no local
+    fallback — a save that silently no-ops would look like success and lose
+    the user's work.
+    """
 
 
 # ── lazy-init state ──────────────────────────────────────────────────
@@ -209,3 +229,104 @@ def upload_file(local_path: Path, key: str) -> bool:
     except Exception as e:
         LOG.warning("R2 upload failed (%s → %s): %s", local_path, key, e)
         return False
+
+
+# ── Object API (used by src/diagrams.py) ────────────────────────────
+#
+# Unlike the log helpers above, these RAISE on failure. Diagram storage has
+# no local fallback: a save that quietly returned False would render as a
+# success in the UI and lose the user's work.
+
+def _client_and_bucket():
+    client = _get_client()
+    if client is None:
+        raise R2Unavailable(
+            "Object storage is not configured. Set R2_ACCOUNT_ID, "
+            "R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME."
+        )
+    bucket = (os.environ.get("R2_BUCKET_NAME") or "").strip()
+    if not bucket:
+        raise R2Unavailable("R2_BUCKET_NAME is not set.")
+    return client, bucket
+
+
+def put_object(
+    key: str,
+    data: bytes,
+    content_type: str = "application/json",
+    cache_control: str = "no-store",
+) -> None:
+    """Write `data` to `key`, overwriting. Raises on failure."""
+    client, bucket = _client_and_bucket()
+    client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+        CacheControl=cache_control,
+    )
+    LOG.debug("R2 PUT s3://%s/%s (%d bytes)", bucket, key, len(data))
+
+
+def put_json(key: str, doc: Any, cache_control: str = "no-store") -> int:
+    """Serialise `doc` and store it at `key`. Returns the byte count.
+
+    Pretty-printed for the same reason the session logs are: the object
+    stays readable in the Cloudflare R2 dashboard, which is the only
+    inspection tool you get without writing an admin UI.
+    """
+    payload = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    put_object(key, payload, "application/json", cache_control)
+    return len(payload)
+
+
+def read_json(key: str) -> Optional[Any]:
+    """Parse the JSON object at `key`, or None if missing/unparseable.
+
+    Missing is a normal outcome (deleted diagram, stale cache entry), so
+    this stays a None rather than an exception. A configuration problem
+    still raises, because that is not a 404.
+    """
+    client, bucket = _client_and_bucket()
+    try:
+        resp = client.get_object(Bucket=bucket, Key=key)
+        return json.loads(resp["Body"].read())
+    except client.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        # A malformed object shouldn't 500 a listing; treat it as absent
+        # and leave a breadcrumb.
+        LOG.warning("R2 read_json failed (%s): %s", key, e)
+        return None
+
+
+def list_objects(prefix: str, max_keys: int = 5000) -> List[Dict[str, Any]]:
+    """Every object under `prefix`, as [{key, size, last_modified}].
+
+    `last_modified` is an ISO-8601 UTC string. Paginates internally and
+    stops at `max_keys` — a listing that large means the caller needs a
+    real database, not a bigger cap, and silently truncating would be
+    worse than an obviously flat number.
+    """
+    client, bucket = _client_and_bucket()
+    out: List[Dict[str, Any]] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []) or []:
+            lm = obj.get("LastModified")
+            out.append({
+                "key": obj["Key"],
+                "size": int(obj.get("Size") or 0),
+                "last_modified": lm.astimezone(timezone.utc).isoformat() if lm else "",
+            })
+            if len(out) >= max_keys:
+                LOG.warning("R2 list_objects hit max_keys=%d for prefix %r", max_keys, prefix)
+                return out
+    return out
+
+
+def delete_object(key: str) -> None:
+    """Delete `key`. Deleting an absent key is a no-op, not an error."""
+    client, bucket = _client_and_bucket()
+    client.delete_object(Bucket=bucket, Key=key)
+    LOG.debug("R2 DELETE s3://%s/%s", bucket, key)

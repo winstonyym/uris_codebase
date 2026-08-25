@@ -258,5 +258,74 @@ class LogRequest(BaseModel):
     events: List[LogEventItem] = Field(default_factory=list)
 
 
+# ── Saved diagrams + public gallery ────────────────────────────────────
+#
+# `data` stays a loose dict rather than a typed CanvasState: the stored
+# shape is the *frontend's* gallery item shape ({nodes, links, meta}), it
+# carries authored extras the reasoning path never sees (x/y, evidence),
+# and `src/diagrams.py` validates it properly — including rejecting
+# dangling links, which pydantic can't express. One validator, one place.
+
+class DiagramSaveRequest(BaseModel):
+    """Create (no `id`) or overwrite (with `id`) one of the caller's diagrams."""
+    id: Optional[str] = None
+    title: str
+    source: Optional[str] = None
+    note: Optional[str] = None
+    author: Optional[str] = None       # display name to attribute a publication to
+    data: Dict[str, Any]
+
+
+class DiagramPublishRequest(BaseModel):
+    """Publish a snapshot of a saved diagram into the public gallery."""
+    author: Optional[str] = None
+
+
+class DiagramCard(BaseModel):
+    """Listing view — everything a gallery card draws, minus the graph."""
+    id: str
+    title: Optional[str] = None
+    source: Optional[str] = None
+    note: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    node_count: int = 0
+    link_count: int = 0
+    subsystems: List[str] = Field(default_factory=list)
+    # Private cards only
+    visibility: Optional[str] = None
+    publications: List[Dict[str, Any]] = Field(default_factory=list)
+    # Public cards only
+    author: Optional[str] = None
+    published_at: Optional[str] = None
+
+
+class DiagramListResponse(BaseModel):
+    items: List[DiagramCard] = Field(default_factory=list)
+
+
+class GalleryListResponse(BaseModel):
+    items: List[DiagramCard] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 24
+    offset: int = 0
+
+
+class DiagramDocument(BaseModel):
+    """A full diagram, graph included."""
+    id: str
+    title: Optional[str] = None
+    source: Optional[str] = None
+    note: Optional[str] = None
+    author: Optional[str] = None
+    visibility: Optional[str] = None
+    status: Optional[str] = None
+    published_from: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    publications: List[Dict[str, Any]] = Field(default_factory=list)
+    data: Dict[str, Any] = Field(default_factory=dict)
+
+
 # Forward refs
 SuggestedNode.model_rebuild()

@@ -21,19 +21,22 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 # Ensure relative-package imports work even when uvicorn launches us oddly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
+from src import diagrams
 from src import usage
 from src.auth import ClerkUser, allowed_origins, conversation_id, require_user
+from src.diagrams import StoreError
+from src.r2_uploader import R2Unavailable
 from src.usage import QuotaExceeded, get_ledger
 from src.causal import CausalReasoner
 from src.chat_agent import ChatAgent
@@ -50,6 +53,11 @@ from src.schemas import (
     CausalQueryResponse,
     ChatRequest,
     ChatResponse,
+    DiagramDocument,
+    DiagramListResponse,
+    DiagramPublishRequest,
+    DiagramSaveRequest,
+    GalleryListResponse,
     LogRequest,
     LoopChatRequest,
     LoopDescribeRequest,
@@ -183,6 +191,23 @@ async def _quota_exceeded_handler(request: Request, exc: QuotaExceeded) -> JSONR
     }
     body.update(exc.detail)
     return JSONResponse(status_code=429, content=body)
+
+
+@app.exception_handler(StoreError)
+async def _store_error_handler(request: Request, exc: StoreError) -> JSONResponse:
+    """Diagram-storage failures carry their own status (400/403/404/409/413)."""
+    return JSONResponse(status_code=exc.status, content={"detail": exc.message})
+
+
+@app.exception_handler(R2Unavailable)
+async def _r2_unavailable_handler(request: Request, exc: R2Unavailable) -> JSONResponse:
+    """R2 isn't configured — a deploy problem, not the caller's fault.
+
+    503 rather than 500 so it reads the same way as the auth guard in
+    `auth.py`: the service is up, this capability isn't wired.
+    """
+    LOG.error("diagram storage unavailable: %s", exc)
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 def _usage_headers(acc: usage.UsageAccumulator) -> Dict[str, str]:
@@ -727,3 +752,130 @@ async def suggest_stream(
         yield {"event": "done", "data": str(int((time.perf_counter() - t0) * 1000))}
 
     return EventSourceResponse(event_gen())
+
+
+# ── Saved diagrams + public gallery ───────────────────────────────────
+#
+# These depend on `require_user`, NOT `billed_caller`. `billed_caller`
+# admits the caller against the free-tier *LLM token* ledger; saving a
+# diagram spends no tokens, and gating it there would mean a user who had
+# exhausted their chat budget could no longer save their own work. Storage
+# has its own, cheaper caps in `src/diagrams.py` (diagrams per user,
+# publications per day).
+#
+# `GET /gallery` and `GET /gallery/{id}` are deliberately open, like
+# /health and /warm, so the pre-sign-in landing page can show the
+# community gallery. Everything that writes requires a verified token.
+#
+# Every handler returns through a response_model, which is also what keeps
+# the internal `owner_id` out of the wire format — it isn't a field on
+# DiagramDocument, so pydantic drops it.
+
+
+def _admin_ids() -> set:
+    raw = (os.environ.get("GALLERY_ADMIN_USER_IDS") or "").strip()
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
+def _display_name(user: ClerkUser) -> Optional[str]:
+    """Best available human name for attribution, from verified claims only."""
+    claims = user.claims or {}
+    for key in ("name", "full_name", "username"):
+        value = claims.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    first = str(claims.get("first_name") or "").strip()
+    last = str(claims.get("last_name") or "").strip()
+    if first or last:
+        return f"{first} {last}".strip()
+    if user.email:
+        return user.email.split("@", 1)[0]
+    return None
+
+
+@app.get("/diagrams", response_model=DiagramListResponse)
+def list_diagrams(user: ClerkUser = Depends(require_user)) -> DiagramListResponse:
+    """The caller's saved diagrams, newest first. Metadata only, no graphs."""
+    return DiagramListResponse(items=diagrams.list_mine(user.user_id))
+
+
+@app.post("/diagrams", response_model=DiagramDocument)
+def save_diagram(
+    req: DiagramSaveRequest,
+    user: ClerkUser = Depends(require_user),
+) -> Dict[str, Any]:
+    """Create a diagram (omit `id`) or overwrite one of the caller's own (send `id`).
+
+    The owner is taken from the verified token, never the body, so the key
+    a caller can address is always inside their own prefix.
+    """
+    return diagrams.save_mine(
+        user.user_id,
+        diagram_id=req.id,
+        title=req.title,
+        data=req.data,
+        source=req.source,
+        note=req.note,
+        author=req.author or _display_name(user),
+    )
+
+
+@app.get("/diagrams/{diagram_id}", response_model=DiagramDocument)
+def get_diagram(diagram_id: str, user: ClerkUser = Depends(require_user)) -> Dict[str, Any]:
+    """One of the caller's diagrams, graph included."""
+    return diagrams.get_mine(user.user_id, diagram_id)
+
+
+@app.delete("/diagrams/{diagram_id}")
+def delete_diagram(diagram_id: str, user: ClerkUser = Depends(require_user)) -> Dict[str, Any]:
+    """Delete one of the caller's diagrams.
+
+    Published snapshots survive — retracting a publication is a separate,
+    explicit DELETE /gallery/{publication_id}.
+    """
+    diagrams.delete_mine(user.user_id, diagram_id)
+    return {"ok": True, "deleted": diagram_id}
+
+
+@app.post("/diagrams/{diagram_id}/publish", response_model=DiagramDocument)
+def publish_diagram(
+    diagram_id: str,
+    req: Optional[DiagramPublishRequest] = None,
+    user: ClerkUser = Depends(require_user),
+) -> Dict[str, Any]:
+    """Copy a saved diagram into the public gallery as an immutable snapshot.
+
+    Returns the publication (its `id` is what /gallery/{id} serves). Later
+    edits to the source diagram do not change it; republishing makes a new
+    entry.
+    """
+    author = (req.author if req else None) or _display_name(user)
+    return diagrams.publish(user.user_id, diagram_id, author=author)
+
+
+@app.get("/gallery", response_model=GalleryListResponse)
+def list_gallery(
+    limit: int = Query(24, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> GalleryListResponse:
+    """Public gallery, newest first. Open — no token required."""
+    items, total = diagrams.list_public(limit=limit, offset=offset)
+    return GalleryListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@app.get("/gallery/{publication_id}", response_model=DiagramDocument)
+def get_publication(publication_id: str) -> Dict[str, Any]:
+    """One published diagram, graph included. Open — no token required."""
+    return diagrams.get_public(publication_id)
+
+
+@app.delete("/gallery/{publication_id}")
+def unpublish_diagram(
+    publication_id: str,
+    user: ClerkUser = Depends(require_user),
+) -> Dict[str, Any]:
+    """Retract a publication. Owner only, unless the caller is an admin."""
+    diagrams.unpublish(
+        user.user_id, publication_id, is_admin=user.user_id in _admin_ids(),
+    )
+    return {"ok": True, "unpublished": publication_id}
